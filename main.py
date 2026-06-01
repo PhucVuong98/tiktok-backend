@@ -17,6 +17,10 @@ load_dotenv()
 
 app = FastAPI(title="TikTok AI Script Factory")
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "TikTok AI Script Factory"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
