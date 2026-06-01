@@ -32,6 +32,66 @@ app.add_middleware(
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # =========================================================================
+# AI VOICE PERSONAS — Nhân vật AI có phong cách riêng
+# =========================================================================
+VOICE_PERSONAS = [
+    {
+        "id": "rapper",
+        "name": "Rapper Đường Phố",
+        "emoji": "🎤",
+        "desc": "Nói có vần, slang Gen Z, ngắn gọn bắt tai",
+        "voice": "echo",
+        "style": "Nói chuyện như rapper: ngắn gọn, có nhịp điệu, hay dùng slang Gen Z (kiểu 'chill', 'vibe', 'flex', 'real talk'), thỉnh thoảng gieo vần tự nhiên. Không dùng từ hoa mỹ."
+    },
+    {
+        "id": "ballad",
+        "name": "Ca Sĩ Ballad",
+        "emoji": "🎵",
+        "desc": "Nhẹ nhàng, cảm xúc, chân thật từ trái tim",
+        "voice": "shimmer",
+        "style": "Nói chuyện nhẹ nhàng, cảm xúc, hay dùng hình ảnh đẹp và ví von. Giọng điệu chân thật như đang chia sẻ từ trái tim, không vội vàng."
+    },
+    {
+        "id": "mc",
+        "name": "MC Năng Động",
+        "emoji": "⚡",
+        "desc": "Sôi nổi, cuốn hút, đầy năng lượng",
+        "voice": "nova",
+        "style": "Nói chuyện như MC: năng lượng cao, cuốn hút, hay dùng câu cảm thán, tạo hứng khởi. Nhịp nói nhanh, dứt khoát, tự tin."
+    },
+    {
+        "id": "chidai",
+        "name": "Chị Đại Miền Nam",
+        "emoji": "👑",
+        "desc": "Thẳng thắn, hài hước, chất miền Nam",
+        "voice": "alloy",
+        "style": "Nói chuyện kiểu chị miền Nam: thẳng thắn, hay xài từ 'nè', 'á', 'hen', 'vậy đó', hài hước tự nhiên, không màu mè. Thỉnh thoảng xổ câu bình dân nghe thân thương."
+    },
+    {
+        "id": "cool",
+        "name": "Anh Trai Cool Ngầu",
+        "emoji": "😎",
+        "desc": "Ít nói, tự tin, câu nào cũng chất",
+        "voice": "onyx",
+        "style": "Nói ít nhưng câu nào cũng có trọng lượng. Tự tin, không cần giải thích nhiều, hay nói kiểu triết lý ngắn. Không hỏi nhiều, chỉ khẳng định."
+    },
+    {
+        "id": "genz",
+        "name": "Cô Nàng Gen Z",
+        "emoji": "✨",
+        "desc": "Trendy, hài hước, cảm xúc mạnh",
+        "voice": "nova",
+        "style": "Nói chuyện kiểu Gen Z: hay dùng 'ơi trời', 'thật ra', 'kiểu là', 'không thể tin được', cảm xúc rõ ràng lên xuống. Hài hước nhưng chân thật, hay kể chuyện theo kiểu 'plot twist'."
+    },
+]
+
+PERSONA_MAP = {p["id"]: p for p in VOICE_PERSONAS}
+
+@app.get("/api/voice-personas")
+def get_voice_personas():
+    return VOICE_PERSONAS
+
+# =========================================================================
 # SHARED: Scrape product info
 # =========================================================================
 async def extract_product_details(url: str) -> dict:
@@ -341,66 +401,54 @@ VOICE_POOL = ["nova", "onyx", "shimmer", "echo", "alloy"]
 
 class DialogueRequest(BaseModel):
     product_url: str
+    persona_a_id: str = "genz"
+    persona_b_id: str = "cool"
 
 class DialogueVoiceRequest(BaseModel):
-    dialogue: str  # raw dialogue text với format [TÊN]:
+    dialogue: str
 
 @app.post("/api/generate-dialogue")
 async def generate_dialogue(req: DialogueRequest):
     if not req.product_url:
         raise HTTPException(status_code=400, detail="Vui lòng nhập link sản phẩm")
 
+    persona_a = PERSONA_MAP.get(req.persona_a_id, VOICE_PERSONAS[0])
+    persona_b = PERSONA_MAP.get(req.persona_b_id, VOICE_PERSONAS[1])
+
     product_info = await extract_product_details(req.product_url)
     product_title = product_info["title"]
 
     try:
-        # Bước 1: AI chọn 2 nhân vật phù hợp sản phẩm
-        chars_raw = call_ai(
-            system="Bạn là chuyên gia marketing TikTok Việt Nam. Chỉ trả về JSON, không giải thích.",
-            user=f"""Sản phẩm: "{product_title}"
-
-Đề xuất 2 nhân vật TikTok Việt Nam phù hợp nhất để tạo kịch bản hội thoại quảng bá sản phẩm này.
-Mỗi nhân vật có tên thật Việt Nam, có mối quan hệ tự nhiên (bạn bè, đồng nghiệp, chị em...).
-
-Trả về JSON, không markdown:
-[
-  {{"name": "Tên nhân vật", "role": "Vai trò/đặc điểm ngắn"}},
-  {{"name": "Tên nhân vật", "role": "Vai trò/đặc điểm ngắn"}}
-]"""
-        )
-        cleaned = chars_raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-        characters = json.loads(cleaned)
-
-        char_a = characters[0]
-        char_b = characters[1]
-
-        # Bước 2: AI viết kịch bản hội thoại tự nhiên
         dialogue = call_ai(
             system="Bạn là biên kịch TikTok chuyên viết kịch bản hội thoại viral cho thị trường Việt Nam. Viết như đời thực, không lộ liễu quảng cáo.",
             user=f"""Sản phẩm: "{product_title}"
-Nhân vật A: {char_a['name']} — {char_a['role']}
-Nhân vật B: {char_b['name']} — {char_b['role']}
 
-Viết kịch bản hội thoại TikTok 60 giây tự nhiên giữa 2 nhân vật. Yêu cầu:
+Nhân vật A — {persona_a['name']}: {persona_a['style']}
+Nhân vật B — {persona_b['name']}: {persona_b['style']}
+
+Viết kịch bản hội thoại TikTok 60 giây. Yêu cầu:
+- Mỗi nhân vật nói ĐÚNG phong cách được mô tả, nghe khác biệt rõ ràng
 - Bắt đầu bằng tình huống đời thường, KHÔNG nhắc sản phẩm ngay
 - Sản phẩm xuất hiện tự nhiên như giải pháp ở giữa video
 - Có 1 câu chê nhỏ để tạo độ tin cậy
 - Kết thúc nhẹ nhàng, không ép mua
 
 Định dạng mỗi dòng thoại ĐÚNG như sau (không thêm gì khác):
-[{char_a['name']}]: nội dung thoại
-[{char_b['name']}]: nội dung thoại
-...
+[{persona_a['name']}]: nội dung thoại
+[{persona_b['name']}]: nội dung thoại
 
 Viết khoảng 12-16 dòng thoại.""",
-            temperature=0.85
+            temperature=0.88
         )
 
         return {
             "status": "success",
             "product_detected": product_title,
             "product_image": product_info.get("image", ""),
-            "characters": characters,
+            "characters": [
+                {"name": persona_a["name"], "emoji": persona_a["emoji"], "desc": persona_a["desc"], "voice": persona_a["voice"], "id": persona_a["id"]},
+                {"name": persona_b["name"], "emoji": persona_b["emoji"], "desc": persona_b["desc"], "voice": persona_b["voice"], "id": persona_b["id"]},
+            ],
             "dialogue": dialogue
         }
     except Exception as e:
@@ -426,7 +474,7 @@ async def generate_dialogue_voice(req: DialogueVoiceRequest):
         char_name = match.group(1).strip()
         voice_override = match.group(2)
         text = match.group(3).strip()
-        if voice_override:
+        if voice_override and voice_override in [p["voice"] for p in VOICE_PERSONAS]:
             voice = voice_override
         elif char_name not in char_voice_map:
             char_voice_map[char_name] = VOICE_POOL[voice_index % len(VOICE_POOL)]
