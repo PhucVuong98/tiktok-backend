@@ -1,9 +1,12 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from playwright.async_api import async_playwright
 import os
+import io
+import re
 import json
 import random
 from openai import OpenAI
@@ -286,6 +289,43 @@ Quy tắc: Nửa đầu KHÔNG nhắc tên sản phẩm. Khen 1 điểm, chê 1 
         "product_image": product_info.get("image", ""),
         "scripts": scripts
     }
+
+
+# =========================================================================
+# PHẦN 4: VOICE SCRIPT — TTS từ kịch bản
+# =========================================================================
+class VoiceRequest(BaseModel):
+    script: str
+    voice: str = "nova"  # nova, alloy, onyx, echo, fable, shimmer
+
+@app.post("/api/generate-voice")
+async def generate_voice(req: VoiceRequest):
+    if not req.script:
+        raise HTTPException(status_code=400, detail="Kịch bản trống")
+
+    # Xóa các stage direction như [HOOK - 3s đầu]:, [BỐI CẢNH QUAY]: ...
+    clean = re.sub(r'\[.*?\]\s*:?', '', req.script)
+    # Xóa dòng trống thừa
+    clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
+
+    if not clean:
+        raise HTTPException(status_code=400, detail="Không có nội dung để đọc")
+
+    try:
+        response = openai_client.audio.speech.create(
+            model="tts-1",
+            voice=req.voice,
+            input=clean,
+            response_format="mp3"
+        )
+        audio_bytes = response.content
+        return StreamingResponse(
+            io.BytesIO(audio_bytes),
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": 'attachment; filename="voice_script.mp3"'}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi TTS: {str(e)}")
 
 
 if __name__ == "__main__":
