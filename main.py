@@ -4,18 +4,16 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from playwright.async_api import async_playwright
 import os
-import re
-import urllib.parse
+import json
+import random
 from openai import OpenAI
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
-import random
 
 load_dotenv()
 
-app = FastAPI(title="TikTok AI Script Factory - Full Version")
+app = FastAPI(title="TikTok AI Script Factory")
 
-# Cấu hình CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,75 +24,12 @@ app.add_middleware(
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-class ScriptRequest(BaseModel):
-    product_url: str
-    tone: str
-
 # =========================================================================
-# PHẦN 1: TÍNH NĂNG TRENDING HOOKS & AI CẬP NHẬT TREND
-# =========================================================================
-TRENDING_HOOKS_DB = [
-    {"id": 1, "category": "Trend", "niche": "Đa ngành", "text": "Top 3 sản phẩm đang làm mưa làm gió tuần này mà bạn chưa biết.", "views": "1.2M"},
-    {"id": 2, "category": "Trend", "niche": "Thời trang", "text": "Đu trend muộn còn hơn không, set đồ này đang quá cháy!", "views": "900K"},
-    {"id": 3, "category": "Drama", "niche": "Review", "text": "Sự thật mất lòng về món đồ này mà không shop nào dám nói cho bạn.", "views": "2.1M"},
-    {"id": 4, "category": "Drama", "niche": "Đời sống", "text": "Bóc phốt cách làm mà mọi người vẫn tin sái cổ bấy lâu nay.", "views": "1.5M"},
-    {"id": 5, "category": "Dễ làm", "niche": "Mẹo vặt", "text": "Chỉ mất đúng 30 giây để giải quyết triệt để vấn đề này.", "views": "850K"},
-    {"id": 6, "category": "Bán hàng", "niche": "Làm đẹp", "text": "Bà nào đang tốn tiền oan thì bơi hết vào video này ngay.", "views": "1.8M"},
-    {"id": 7, "category": "Bán hàng", "niche": "Đa ngành", "text": "Mình đã định không mua đâu, cho đến khi thấy tính năng thứ 2 của em nó...", "views": "1.1M"}
-]
-
-@app.get("/api/trending-hooks")
-def get_trending_hooks(category: str = "Tất cả"):
-    if category == "Tất cả":
-        return TRENDING_HOOKS_DB
-    return [h for h in TRENDING_HOOKS_DB if h["category"] == category]
-
-@app.post("/api/ai-update-trends")
-def ai_update_trends():
-    system_prompt = "Bạn là một AI phân tích dữ liệu TikTok Việt Nam."
-    user_prompt = """
-    Hãy đóng vai chuyên gia bắt trend, sáng tạo ra 4 câu Hook (Mở đầu video) cực kỳ cuốn hút, đánh trúng tâm lý người xem ngay lúc này. 
-    Yêu cầu trả về đúng 4 câu thuộc 4 danh mục: Trend, Drama, Dễ làm, Bán hàng.
-    Trả về ĐÚNG định dạng có chứa dấu phẩy phân cách như sau (không nói gì thêm):
-    Trend|[Ngách]|Nội dung câu hook
-    Drama|[Ngách]|Nội dung câu hook
-    Dễ làm|[Ngách]|Nội dung câu hook
-    Bán hàng|[Ngách]|Nội dung câu hook
-    """
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.8
-        )
-        raw_text = response.choices[0].message.content.strip().split("\n")
-        new_hooks = []
-        for line in raw_text:
-            parts = line.split("|")
-            if len(parts) >= 3:
-                new_hooks.append({
-                    "id": random.randint(100, 999),
-                    "category": parts[0].strip(),
-                    "niche": parts[1].strip(),
-                    "text": parts[2].strip(),
-                    "views": f"{random.randint(100, 999)}K"
-                })
-        global TRENDING_HOOKS_DB
-        TRENDING_HOOKS_DB = new_hooks + TRENDING_HOOKS_DB
-        return {"status": "success", "message": "Đã cập nhật xu hướng mới!"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# =========================================================================
-# PHẦN 2: TÍNH NĂNG CÀO DỮ LIỆU SHOPEE & TẠO KỊCH BẢN TỰ NHIÊN
+# SHARED: Scrape product info
 # =========================================================================
 async def extract_product_details(url: str) -> dict:
-    print(f"\n[LOG] Đang xử lý link: {url}")
     current_url = url.strip()
-    
+
     if "shopee.vn" not in current_url or "shp.ee" in current_url:
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
@@ -114,18 +49,14 @@ async def extract_product_details(url: str) -> dict:
             res = await client.get(current_url, headers=bot_headers)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, "html.parser")
-                og_title_tag = soup.find("meta", property="og:title")
-                title = ""
-                if og_title_tag and og_title_tag.get("content"):
-                    title = og_title_tag["content"].strip()
-                    if "Mua và Bán" in title or "Shopee Việt Nam" == title:
-                        title = "" 
-                
-                og_image_tag = soup.find("meta", property="og:image")
-                image_url = og_image_tag["content"].strip() if og_image_tag and og_image_tag.get("content") else ""
-
+                og_title = soup.find("meta", property="og:title")
+                title = og_title["content"].strip() if og_title and og_title.get("content") else ""
+                if "Mua và Bán" in title or title == "Shopee Việt Nam":
+                    title = ""
+                og_image = soup.find("meta", property="og:image")
+                image_url = og_image["content"].strip() if og_image and og_image.get("content") else ""
                 if title:
-                    return {"title": title, "image": image_url, "description": "Lấy thành công."}
+                    return {"title": title, "image": image_url}
     except:
         pass
 
@@ -138,79 +69,225 @@ async def extract_product_details(url: str) -> dict:
             )
             page = await context.new_page()
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
-            
             await page.goto(current_url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(4000) 
-            
+            await page.wait_for_timeout(4000)
             raw_title = await page.title()
             image_url = ""
             try:
-                img_element = await page.query_selector("meta[itemprop='image']")
-                if img_element:
-                    image_url = await img_element.get_attribute("content")
+                img_el = await page.query_selector("meta[itemprop='image']")
+                if img_el:
+                    image_url = await img_el.get_attribute("content")
             except:
                 pass
-
-            is_trash_title = "Mua và Bán" in raw_title or "Shopee Việt Nam" == raw_title.strip() or not raw_title
-            if not is_trash_title:
-                playwright_title = raw_title.replace("| Shopee Việt Nam", "").replace("Shopee Việt Nam", "").strip()
-                await browser.close()
-                return {"title": playwright_title, "image": image_url, "description": "Lấy bằng Playwright."}
-                
             await browser.close()
+            is_trash = "Mua và Bán" in raw_title or raw_title.strip() == "Shopee Việt Nam" or not raw_title
+            if not is_trash:
+                title = raw_title.replace("| Shopee Việt Nam", "").replace("Shopee Việt Nam", "").strip()
+                return {"title": title, "image": image_url}
     except:
         pass
 
-    return {"title": "Sản phẩm Shopee", "image": "", "description": "Không thể lấy thông tin"}
+    return {"title": "Sản phẩm Shopee", "image": ""}
 
+
+def call_ai(system: str, user: str, temperature: float = 0.8) -> str:
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ],
+        temperature=temperature
+    )
+    return response.choices[0].message.content.strip()
+
+
+# =========================================================================
+# PHẦN 1: TRENDING HOOKS — AI-generated, không hardcode
+# =========================================================================
+_hooks_cache: list = []
+
+def _generate_hooks_from_ai() -> list:
+    raw = call_ai(
+        system="Bạn là chuyên gia phân tích trend TikTok Việt Nam. Chỉ trả về JSON, không giải thích.",
+        user="""Tạo 8 câu Hook TikTok đang viral cho thị trường Việt Nam (2 câu mỗi danh mục: Trend, Drama, Dễ làm, Bán hàng).
+Trả về JSON array đúng format sau, không có markdown:
+[
+  {"category": "Trend", "niche": "Thời trang", "text": "Câu hook ở đây", "views": "1.2M"},
+  ...
+]"""
+    )
+    try:
+        cleaned = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        hooks = json.loads(cleaned)
+        for i, h in enumerate(hooks):
+            h["id"] = i + 1
+        return hooks
+    except:
+        return []
+
+@app.get("/api/trending-hooks")
+def get_trending_hooks(category: str = "Tất cả"):
+    global _hooks_cache
+    if not _hooks_cache:
+        _hooks_cache = _generate_hooks_from_ai()
+    if category == "Tất cả":
+        return _hooks_cache
+    return [h for h in _hooks_cache if h.get("category") == category]
+
+@app.post("/api/ai-update-trends")
+def ai_update_trends():
+    global _hooks_cache
+    new_hooks = _generate_hooks_from_ai()
+    if not new_hooks:
+        raise HTTPException(status_code=500, detail="AI không tạo được hooks mới")
+    _hooks_cache = new_hooks
+    return {"status": "success", "message": "Đã cập nhật xu hướng mới!", "count": len(new_hooks)}
+
+
+# =========================================================================
+# PHẦN 2: SCRIPT ĐƠN — 1 kịch bản theo tone
+# =========================================================================
+class ScriptRequest(BaseModel):
+    product_url: str
+    tone: str
 
 @app.post("/api/generate-script")
 async def generate_script(req: ScriptRequest):
     if not req.product_url:
         raise HTTPException(status_code=400, detail="Vui lòng nhập link sản phẩm")
-    
+
     product_info = await extract_product_details(req.product_url)
-    
-    system_prompt = "Bạn là một Content Creator TikTok tài năng. Bạn bán hàng 'như không bán'. Lồng ghép sản phẩm vào tình huống đời thường một cách chân thật nhất."
-    
-    user_prompt = f"""
-Sản phẩm cần lồng ghép: "{product_info['title']}"
+
+    try:
+        script = call_ai(
+            system="Bạn là Content Creator TikTok tài năng. Bạn bán hàng 'như không bán'. Lồng ghép sản phẩm vào tình huống đời thường một cách chân thật nhất.",
+            user=f"""Sản phẩm: "{product_info['title']}"
 Tone giọng: {req.tone}
 
-Hãy viết kịch bản video ngắn (45 giây):
-1. Nửa đầu video tuyệt đối KHÔNG NHẮC ĐẾN TÊN SẢN PHẨM. Bắt đầu bằng một vấn đề/câu chuyện.
-2. Giữa video: Đưa sản phẩm ra như một "vị cứu tinh". Khen 1 điểm, chê 1 điểm nhỏ cho chân thật.
-3. Cuối video: Gợi ý mua hàng cực kỳ nhẹ nhàng.
+Viết kịch bản video 45 giây:
+1. Nửa đầu KHÔNG nhắc tên sản phẩm. Bắt đầu bằng vấn đề/câu chuyện.
+2. Giữa video: đưa sản phẩm ra như "vị cứu tinh". Khen 1 điểm, chê 1 điểm nhỏ cho chân thật.
+3. Cuối: gợi ý mua hàng nhẹ nhàng.
 
 Định dạng bắt buộc:
-[BỐI CẢNH QUAY]: 
-[HOOK - 3s đầu]: 
-[STORYTELLING - 15s]: 
-[GIẢI PHÁP TỰ NHIÊN - 15s]: 
-[CTA TINH TẾ - 5s]: 
-"""
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.75 
+[BỐI CẢNH QUAY]:
+[HOOK - 3s đầu]:
+[STORYTELLING - 15s]:
+[GIẢI PHÁP TỰ NHIÊN - 15s]:
+[CTA TINH TẾ - 5s]:""",
+            temperature=0.75
         )
-        script_generated = response.choices[0].message.content
-        
         return {
             "status": "success",
-            "product_detected": product_info['title'],
-            "product_image": product_info.get('image', ''),
-            "script": script_generated
+            "product_detected": product_info["title"],
+            "product_image": product_info.get("image", ""),
+            "script": script
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi AI Engine: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Lỗi AI: {str(e)}")
 
-# Khởi chạy server
+
+# =========================================================================
+# PHẦN 3: SCRIPT 3 PERSONA — AI tự chọn persona phù hợp sản phẩm
+# =========================================================================
+class PersonaScriptRequest(BaseModel):
+    product_url: str
+
+@app.post("/api/generate-persona-scripts")
+async def generate_persona_scripts(req: PersonaScriptRequest):
+    if not req.product_url:
+        raise HTTPException(status_code=400, detail="Vui lòng nhập link sản phẩm")
+
+    product_info = await extract_product_details(req.product_url)
+    product_title = product_info["title"]
+
+    # Bước 1: AI phân tích sản phẩm và đề xuất 3 persona phù hợp nhất
+    try:
+        personas_raw = call_ai(
+            system="Bạn là chuyên gia marketing TikTok Việt Nam. Chỉ trả về JSON, không giải thích.",
+            user=f"""Sản phẩm: "{product_title}"
+
+Phân tích sản phẩm và đề xuất 3 nhân vật (persona) người dùng TikTok Việt Nam phù hợp NHẤT để quảng bá sản phẩm này.
+Mỗi persona phải có câu chuyện cá nhân liên quan trực tiếp đến sản phẩm.
+
+Trả về JSON array đúng format, không markdown:
+[
+  {{
+    "id": 1,
+    "emoji": "emoji phù hợp",
+    "name": "Tên nhân vật ngắn gọn",
+    "desc": "Mô tả 1 dòng (tuổi · đặc điểm · pain point)",
+    "story_angle": "Góc kể chuyện cho nhân vật này với sản phẩm trên"
+  }},
+  ...3 items...
+]"""
+        )
+        cleaned = personas_raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        personas = json.loads(cleaned)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi phân tích persona: {str(e)}")
+
+    # Bước 2: AI viết kịch bản cho từng persona
+    try:
+        persona_list_str = "\n".join([
+            f"PERSONA {p['id']}: {p['name']} — {p['desc']}\nGóc kể chuyện: {p['story_angle']}"
+            for p in personas
+        ])
+
+        scripts_raw = call_ai(
+            system="Bạn là chuyên gia viết kịch bản TikTok bán hàng affiliate Việt Nam. Viết tự nhiên, chân thật, không lộ liễu quảng cáo.",
+            user=f"""Sản phẩm: "{product_title}"
+
+{persona_list_str}
+
+Viết 3 kịch bản TikTok 60 giây, mỗi kịch bản cho 1 persona. Dùng đúng marker phân tách.
+
+===PERSONA_1===
+[0-3s] HOOK:
+[3-15s] VẤN ĐỀ:
+[15-40s] GIẢI PHÁP:
+[40-55s] DEMO:
+[55-60s] CTA:
+
+===PERSONA_2===
+[0-3s] HOOK:
+[3-15s] VẤN ĐỀ:
+[15-40s] GIẢI PHÁP:
+[40-55s] DEMO:
+[55-60s] CTA:
+
+===PERSONA_3===
+[0-3s] HOOK:
+[3-15s] VẤN ĐỀ:
+[15-40s] GIẢI PHÁP:
+[40-55s] DEMO:
+[55-60s] CTA:
+
+Quy tắc: Nửa đầu KHÔNG nhắc tên sản phẩm. Khen 1 điểm, chê 1 điểm nhỏ cho chân thật.""",
+            temperature=0.8
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi viết kịch bản: {str(e)}")
+
+    # Parse scripts theo marker
+    scripts = []
+    for i, persona in enumerate(personas):
+        marker = f"===PERSONA_{i+1}==="
+        next_marker = f"===PERSONA_{i+2}===" if i < len(personas) - 1 else None
+        start = scripts_raw.find(marker)
+        end = scripts_raw.find(next_marker) if next_marker else len(scripts_raw)
+        block = scripts_raw[start + len(marker):end].strip() if start != -1 else ""
+        scripts.append({**persona, "script": block})
+
+    return {
+        "status": "success",
+        "product_detected": product_title,
+        "product_image": product_info.get("image", ""),
+        "scripts": scripts
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-    
