@@ -332,6 +332,135 @@ async def generate_voice(req: VoiceRequest):
         raise HTTPException(status_code=500, detail=f"Lỗi TTS: {str(e)}")
 
 
+# =========================================================================
+# PHẦN 5: DIALOGUE SCRIPT + VOICE — Hội thoại đa nhân vật, ghép audio
+# =========================================================================
+
+# Bảng gán giọng cho từng nhân vật (xoay vòng)
+VOICE_POOL = ["nova", "onyx", "shimmer", "echo", "alloy"]
+
+class DialogueRequest(BaseModel):
+    product_url: str
+
+class DialogueVoiceRequest(BaseModel):
+    dialogue: str  # raw dialogue text với format [TÊN]:
+
+@app.post("/api/generate-dialogue")
+async def generate_dialogue(req: DialogueRequest):
+    if not req.product_url:
+        raise HTTPException(status_code=400, detail="Vui lòng nhập link sản phẩm")
+
+    product_info = await extract_product_details(req.product_url)
+    product_title = product_info["title"]
+
+    try:
+        # Bước 1: AI chọn 2 nhân vật phù hợp sản phẩm
+        chars_raw = call_ai(
+            system="Bạn là chuyên gia marketing TikTok Việt Nam. Chỉ trả về JSON, không giải thích.",
+            user=f"""Sản phẩm: "{product_title}"
+
+Đề xuất 2 nhân vật TikTok Việt Nam phù hợp nhất để tạo kịch bản hội thoại quảng bá sản phẩm này.
+Mỗi nhân vật có tên thật Việt Nam, có mối quan hệ tự nhiên (bạn bè, đồng nghiệp, chị em...).
+
+Trả về JSON, không markdown:
+[
+  {{"name": "Tên nhân vật", "role": "Vai trò/đặc điểm ngắn"}},
+  {{"name": "Tên nhân vật", "role": "Vai trò/đặc điểm ngắn"}}
+]"""
+        )
+        cleaned = chars_raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        characters = json.loads(cleaned)
+
+        char_a = characters[0]
+        char_b = characters[1]
+
+        # Bước 2: AI viết kịch bản hội thoại tự nhiên
+        dialogue = call_ai(
+            system="Bạn là biên kịch TikTok chuyên viết kịch bản hội thoại viral cho thị trường Việt Nam. Viết như đời thực, không lộ liễu quảng cáo.",
+            user=f"""Sản phẩm: "{product_title}"
+Nhân vật A: {char_a['name']} — {char_a['role']}
+Nhân vật B: {char_b['name']} — {char_b['role']}
+
+Viết kịch bản hội thoại TikTok 60 giây tự nhiên giữa 2 nhân vật. Yêu cầu:
+- Bắt đầu bằng tình huống đời thường, KHÔNG nhắc sản phẩm ngay
+- Sản phẩm xuất hiện tự nhiên như giải pháp ở giữa video
+- Có 1 câu chê nhỏ để tạo độ tin cậy
+- Kết thúc nhẹ nhàng, không ép mua
+
+Định dạng mỗi dòng thoại ĐÚNG như sau (không thêm gì khác):
+[{char_a['name']}]: nội dung thoại
+[{char_b['name']}]: nội dung thoại
+...
+
+Viết khoảng 12-16 dòng thoại.""",
+            temperature=0.85
+        )
+
+        return {
+            "status": "success",
+            "product_detected": product_title,
+            "product_image": product_info.get("image", ""),
+            "characters": characters,
+            "dialogue": dialogue
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi tạo kịch bản: {str(e)}")
+
+
+@app.post("/api/generate-dialogue-voice")
+async def generate_dialogue_voice(req: DialogueVoiceRequest):
+    if not req.dialogue:
+        raise HTTPException(status_code=400, detail="Kịch bản trống")
+
+    # Parse từng dòng thoại: [TÊN|voice]: nội dung hoặc [TÊN]: nội dung
+    line_pattern = re.compile(r'^\[(.+?)(?:\|(\w+))?\]:\s*(.+)$')
+    lines = []
+    char_voice_map = {}
+    voice_index = 0
+
+    for raw_line in req.dialogue.strip().split('\n'):
+        raw_line = raw_line.strip()
+        match = line_pattern.match(raw_line)
+        if not match:
+            continue
+        char_name = match.group(1).strip()
+        voice_override = match.group(2)
+        text = match.group(3).strip()
+        if voice_override:
+            voice = voice_override
+        elif char_name not in char_voice_map:
+            char_voice_map[char_name] = VOICE_POOL[voice_index % len(VOICE_POOL)]
+            voice_index += 1
+            voice = char_voice_map[char_name]
+        else:
+            voice = char_voice_map[char_name]
+        lines.append((char_name, text, voice))
+
+    if not lines:
+        raise HTTPException(status_code=400, detail="Không parse được dòng thoại nào")
+
+    # Tạo audio từng dòng rồi ghép lại
+    try:
+        audio_parts = []
+        for _, text, voice in lines:
+            resp = openai_client.audio.speech.create(
+                model="tts-1",
+                voice=voice,
+                input=text,
+                response_format="mp3"
+            )
+            audio_parts.append(resp.content)
+
+        combined = b''.join(audio_parts)
+        return StreamingResponse(
+            io.BytesIO(combined),
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": 'attachment; filename="dialogue_voice.mp3"'}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi TTS: {str(e)}")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
