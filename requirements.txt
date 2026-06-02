@@ -6,3 +6,6 @@ playwright
 openai
 python-dotenv
 beautifulsoup4
+moviepy
+Pillow
+numpy

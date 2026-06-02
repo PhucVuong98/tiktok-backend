@@ -9,6 +9,10 @@ import io
 import re
 import json
 import random
+import textwrap
+import tempfile
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from openai import OpenAI
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
@@ -507,6 +511,189 @@ async def generate_dialogue_voice(req: DialogueVoiceRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi TTS: {str(e)}")
+
+
+# =========================================================================
+# PHẦN 6: VIDEO GENERATOR — Tạo video TikTok 9:16 từ script + voice + ảnh
+# =========================================================================
+VID_W, VID_H = 720, 1280
+
+def _get_font(size: int) -> ImageFont.FreeTypeFont:
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    ]
+    for p in paths:
+        try:
+            return ImageFont.truetype(p, size)
+        except:
+            pass
+    return ImageFont.load_default()
+
+def _parse_captions(script: str) -> list:
+    clean = re.sub(r'\[.*?\]\s*:?', '', script)
+    clean = re.sub(r'\n{2,}', '\n', clean).strip()
+    sentences = []
+    for line in clean.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r'(?<=[.!?])\s+', line)
+        for part in parts:
+            part = part.strip()
+            if len(part) < 5:
+                continue
+            words = part.split()
+            if len(words) > 10:
+                for i in range(0, len(words), 9):
+                    chunk = ' '.join(words[i:i+9])
+                    if chunk:
+                        sentences.append(chunk)
+            else:
+                sentences.append(part)
+    return sentences or [script[:200]]
+
+def _build_bg(img_bytes: bytes | None) -> np.ndarray:
+    bg = Image.new("RGB", (VID_W, VID_H), (12, 12, 12))
+    if img_bytes:
+        try:
+            prod = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            top_h = VID_H // 2
+
+            # Blurred full-width background
+            sq = prod.resize((VID_W, VID_W), Image.LANCZOS)
+            blur = sq.filter(ImageFilter.GaussianBlur(35))
+            bg.paste(blur.crop((0, 0, VID_W, min(blur.height, top_h))).resize((VID_W, top_h)), (0, 0))
+
+            # Dark overlay
+            dark = Image.new("RGB", (VID_W, top_h), (0, 0, 0))
+            mask = Image.new("L", (VID_W, top_h), 140)
+            bg.paste(dark, (0, 0), mask)
+
+            # Product thumbnail centered in top half
+            size = 480
+            thumb = prod.resize((size, size), Image.LANCZOS)
+            bg.paste(thumb, ((VID_W - size) // 2, (top_h - size) // 2))
+        except:
+            pass
+    return np.array(bg)
+
+def _render_slide(bg_arr: np.ndarray, caption: str, product_name: str) -> np.ndarray:
+    img = Image.fromarray(bg_arr.copy())
+    cap_y = VID_H // 2 + 20
+    cap_h = VID_H - cap_y
+
+    # Semi-transparent caption area
+    overlay = Image.new("RGBA", (VID_W, cap_h), (0, 0, 0, 170))
+    base = img.convert("RGBA")
+    base.paste(overlay, (0, cap_y), overlay)
+    img = base.convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    font_name = _get_font(30)
+    font_cap = _get_font(54)
+
+    # Product name
+    if product_name:
+        label = product_name[:44] + "…" if len(product_name) > 44 else product_name
+        try:
+            draw.text((VID_W // 2, cap_y + 38), label, font=font_name, fill=(180, 180, 180), anchor="mm")
+        except TypeError:
+            draw.text((10, cap_y + 20), label, font=font_name, fill=(180, 180, 180))
+
+    # Caption text
+    wrapped = textwrap.wrap(caption, width=20)
+    line_h = 72
+    total_h = len(wrapped) * line_h
+    y = cap_y + (cap_h - total_h) // 2 + 20
+
+    for line in wrapped:
+        try:
+            draw.text((VID_W // 2 + 2, y + 2), line, font=font_cap, fill=(0, 0, 0), anchor="mm")
+            draw.text((VID_W // 2, y), line, font=font_cap, fill=(255, 255, 255), anchor="mm")
+        except TypeError:
+            draw.text((40, y), line, font=font_cap, fill=(255, 255, 255))
+        y += line_h
+
+    # Progress indicator (thin white line at very bottom)
+    draw.rectangle([0, VID_H - 8, VID_W, VID_H], fill=(50, 50, 50))
+
+    return np.array(img)
+
+
+class VideoRequest(BaseModel):
+    script: str
+    voice: str = "nova"
+    product_image_url: str = ""
+    product_name: str = ""
+
+@app.post("/api/generate-video")
+async def generate_video(req: VideoRequest):
+    if not req.script:
+        raise HTTPException(status_code=400, detail="Script trống")
+
+    captions = _parse_captions(req.script)
+
+    clean = re.sub(r'\[.*?\]\s*:?', '', req.script)
+    clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Script rỗng sau khi làm sạch")
+
+    try:
+        tts = openai_client.audio.speech.create(
+            model="tts-1", voice=req.voice, input=clean, response_format="mp3"
+        )
+        audio_bytes = tts.content
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi TTS: {e}")
+
+    img_bytes = None
+    if req.product_image_url:
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                r = await c.get(req.product_image_url)
+                if r.status_code == 200:
+                    img_bytes = r.content
+        except:
+            pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio_path = os.path.join(tmp, "audio.mp3")
+        video_path = os.path.join(tmp, "video.mp4")
+
+        with open(audio_path, "wb") as f:
+            f.write(audio_bytes)
+
+        from moviepy.editor import ImageClip, concatenate_videoclips, AudioFileClip
+
+        audio_clip = AudioFileClip(audio_path)
+        duration = audio_clip.duration
+
+        bg_arr = _build_bg(img_bytes)
+        time_per = duration / len(captions)
+        slides = [_render_slide(bg_arr, c, req.product_name) for c in captions]
+        clips = [ImageClip(s, duration=time_per) for s in slides]
+
+        video = concatenate_videoclips(clips, method="compose")
+        video = video.set_audio(audio_clip)
+        video.write_videofile(
+            video_path, fps=24, codec="libx264", audio_codec="aac",
+            temp_audiofile=os.path.join(tmp, "tmp_audio.m4a"),
+            remove_temp=True, logger=None
+        )
+
+        with open(video_path, "rb") as f:
+            mp4 = f.read()
+
+        video.close()
+        audio_clip.close()
+
+    return StreamingResponse(
+        io.BytesIO(mp4), media_type="video/mp4",
+        headers={"Content-Disposition": 'attachment; filename="tiktok_video.mp4"'}
+    )
 
 
 if __name__ == "__main__":
