@@ -6,6 +6,6 @@ playwright
 openai
 python-dotenv
 beautifulsoup4
-moviepy
+moviepy==1.0.3
 Pillow
 numpy

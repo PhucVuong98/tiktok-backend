@@ -666,29 +666,32 @@ async def generate_video(req: VideoRequest):
         with open(audio_path, "wb") as f:
             f.write(audio_bytes)
 
-        from moviepy.editor import ImageClip, concatenate_videoclips, AudioFileClip
+        try:
+            from moviepy.editor import ImageClip, concatenate_videoclips, AudioFileClip
 
-        audio_clip = AudioFileClip(audio_path)
-        duration = audio_clip.duration
+            audio_clip = AudioFileClip(audio_path)
+            duration = audio_clip.duration
 
-        bg_arr = _build_bg(img_bytes)
-        time_per = duration / len(captions)
-        slides = [_render_slide(bg_arr, c, req.product_name) for c in captions]
-        clips = [ImageClip(s, duration=time_per) for s in slides]
+            bg_arr = _build_bg(img_bytes)
+            time_per = duration / len(captions)
+            slides = [_render_slide(bg_arr, c, req.product_name) for c in captions]
+            clips = [ImageClip(s, duration=time_per) for s in slides]
 
-        video = concatenate_videoclips(clips, method="compose")
-        video = video.set_audio(audio_clip)
-        video.write_videofile(
-            video_path, fps=24, codec="libx264", audio_codec="aac",
-            temp_audiofile=os.path.join(tmp, "tmp_audio.m4a"),
-            remove_temp=True, logger=None
-        )
+            video = concatenate_videoclips(clips, method="compose")
+            video = video.set_audio(audio_clip)
+            video.write_videofile(
+                video_path, fps=24, codec="libx264", audio_codec="aac",
+                temp_audiofile=os.path.join(tmp, "tmp_audio.m4a"),
+                remove_temp=True, logger=None
+            )
 
-        with open(video_path, "rb") as f:
-            mp4 = f.read()
+            with open(video_path, "rb") as f:
+                mp4 = f.read()
 
-        video.close()
-        audio_clip.close()
+            video.close()
+            audio_clip.close()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Lỗi render video: {e}")
 
     return StreamingResponse(
         io.BytesIO(mp4), media_type="video/mp4",
