@@ -629,6 +629,57 @@ class VideoRequest(BaseModel):
     product_image_url: str = ""
     product_name: str = ""
 
+
+def _synth_video_audio(script: str, default_voice: str) -> bytes:
+    """Sinh audio cho video.
+    - Neu script la hoi thoai (nhieu dong dang [Ten|voice]: ... hoac [Ten]: ...)
+      thi doc tung dong bang giong rieng cua moi nhan vat roi ghep lai (da giong).
+    - Nguoc lai (script don) thi doc bang 1 giong `default_voice`.
+    """
+    line_pattern = re.compile(r'^\[(.+?)(?:\|(\w+))?\]:\s*(.+)$')
+    valid_voices = [p["voice"] for p in VOICE_PERSONAS]
+    parsed = []
+    char_voice_map = {}
+    voice_index = 0
+
+    for raw in script.strip().split('\n'):
+        m = line_pattern.match(raw.strip())
+        if not m:
+            continue
+        char_name = m.group(1).strip()
+        voice_override = m.group(2)
+        text = m.group(3).strip()
+        if voice_override and voice_override in valid_voices:
+            voice = voice_override
+        elif char_name not in char_voice_map:
+            char_voice_map[char_name] = VOICE_POOL[voice_index % len(VOICE_POOL)]
+            voice_index += 1
+            voice = char_voice_map[char_name]
+        else:
+            voice = char_voice_map[char_name]
+        parsed.append((text, voice))
+
+    # Hoi thoai: >=2 dong co tag nhan vat -> ghep da giong
+    if len(parsed) >= 2:
+        parts = []
+        for text, voice in parsed:
+            resp = openai_client.audio.speech.create(
+                model="tts-1", voice=voice, input=text, response_format="mp3"
+            )
+            parts.append(resp.content)
+        return b''.join(parts)
+
+    # Script don -> 1 giong
+    clean = re.sub(r'\[.*?\]\s*:?', '', script)
+    clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Script rỗng sau khi làm sạch")
+    resp = openai_client.audio.speech.create(
+        model="tts-1", voice=default_voice, input=clean, response_format="mp3"
+    )
+    return resp.content
+
+
 @app.post("/api/generate-video")
 async def generate_video(req: VideoRequest):
     if not req.script:
@@ -636,16 +687,10 @@ async def generate_video(req: VideoRequest):
 
     captions = _parse_captions(req.script)
 
-    clean = re.sub(r'\[.*?\]\s*:?', '', req.script)
-    clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
-    if not clean:
-        raise HTTPException(status_code=400, detail="Script rỗng sau khi làm sạch")
-
     try:
-        tts = openai_client.audio.speech.create(
-            model="tts-1", voice=req.voice, input=clean, response_format="mp3"
-        )
-        audio_bytes = tts.content
+        audio_bytes = _synth_video_audio(req.script, req.voice)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi TTS: {e}")
 
@@ -667,20 +712,30 @@ async def generate_video(req: VideoRequest):
             f.write(audio_bytes)
 
         try:
-            from moviepy.editor import ImageClip, concatenate_videoclips, AudioFileClip
+            from moviepy.editor import VideoClip, AudioFileClip
 
             audio_clip = AudioFileClip(audio_path)
             duration = audio_clip.duration
 
             bg_arr = _build_bg(img_bytes)
-            time_per = duration / len(captions)
-            slides = [_render_slide(bg_arr, c, req.product_name) for c in captions]
-            clips = [ImageClip(s, duration=time_per) for s in slides]
+            n = max(1, len(captions))
+            time_per = duration / n
 
-            video = concatenate_videoclips(clips, method="compose")
+            # Render từng khung theo thời gian (make_frame) để chỉ giữ 1 khung
+            # trong RAM tại một thời điểm -> tránh OOM trên free tier 512MB.
+            _cache = {"idx": -1, "frame": None}
+            def make_frame(t):
+                idx = min(int(t / time_per), n - 1)
+                if idx != _cache["idx"]:
+                    _cache["idx"] = idx
+                    _cache["frame"] = _render_slide(bg_arr, captions[idx], req.product_name)
+                return _cache["frame"]
+
+            video = VideoClip(make_frame, duration=duration)
             video = video.set_audio(audio_clip)
             video.write_videofile(
                 video_path, fps=24, codec="libx264", audio_codec="aac",
+                preset="ultrafast", threads=2,
                 temp_audiofile=os.path.join(tmp, "tmp_audio.m4a"),
                 remove_temp=True, logger=None
             )
