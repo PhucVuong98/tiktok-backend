@@ -8,6 +8,7 @@ import os
 import io
 import re
 import json
+import base64
 import random
 import textwrap
 import tempfile
@@ -624,6 +625,147 @@ def _render_slide(bg_arr: np.ndarray, caption: str, product_name: str) -> np.nda
     return np.array(img)
 
 
+# =========================================================================
+# ANIMATION: anh AI (gpt-image-1) + chuyen dong dien anh (Ken Burns)
+# =========================================================================
+AW, AH = 540, 960          # do phan giai video animation (9:16, nhe cho free tier)
+KB_Z = 1.25                # bien du de zoom/pan trong anh
+KB_PRESETS = [             # (fx0, fy0, fx1, fy1, zoom_in)
+    (0.0, 0.0, 1.0, 1.0, True),
+    (1.0, 0.0, 0.0, 1.0, False),
+    (0.5, 1.0, 0.5, 0.0, True),
+    (0.0, 1.0, 1.0, 0.0, False),
+]
+
+def _lerp(a, b, t):
+    return a + (b - a) * t
+
+def _fallback_scene(i: int) -> Image.Image:
+    """Gradient mau lam canh du phong khi sinh anh AI that bai."""
+    pals = [((20,30,60),(120,40,90)), ((10,40,40),(40,120,90)),
+            ((60,20,40),(160,90,40)), ((20,20,30),(80,40,120))]
+    c1, c2 = pals[i % len(pals)]
+    f = (np.arange(AH) / AH)[:, None]
+    base = np.zeros((AH, AW, 3), np.uint8)
+    for k in range(3):
+        base[..., k] = (c1[k] + (c2[k] - c1[k]) * f).astype(np.uint8)
+    return Image.fromarray(base)
+
+def _gen_scene_prompts(script: str, product_name: str, n: int) -> list:
+    """Dung gpt-4o-mini sinh n prompt anh (tieng Anh) tu noi dung script."""
+    excerpt = re.sub(r'\[.*?\]\s*:?', '', script).strip()[:600]
+    prompts = []
+    try:
+        r = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": (
+                f"You write vivid cinematic IMAGE prompts (English) for a vertical 9:16 short "
+                f"video advertising this product: \"{product_name or 'a product'}\".\n"
+                f"Script context:\n{excerpt}\n\n"
+                f"Output EXACTLY {n} prompts, one per line, no numbering. Each is one rich visual "
+                f"scene (setting, subject, lighting, mood, color) relevant to the product/story, "
+                f"energetic and modern for social media. No text or words inside the image."
+            )}],
+            temperature=0.9,
+        )
+        lines = [l.strip(" -*\t0123456789.") for l in r.choices[0].message.content.splitlines()]
+        prompts = [l for l in lines if len(l) > 8][:n]
+    except Exception:
+        prompts = []
+    while len(prompts) < n:
+        prompts.append(f"Cinematic vibrant lifestyle scene featuring {product_name or 'a trendy product'}, "
+                       f"dynamic lighting, modern, energetic, vertical composition, ultra detailed")
+    return prompts
+
+def _gen_scene_images(prompts: list) -> list:
+    """Sinh anh canh bang gpt-image-1 (song song). Tra ve list PIL hoac None."""
+    def gen(pr):
+        try:
+            r = openai_client.images.generate(
+                model="gpt-image-1", prompt=pr, size="1024x1536", quality="low", n=1
+            )
+            return Image.open(io.BytesIO(base64.b64decode(r.data[0].b64_json))).convert("RGB")
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        return list(ex.map(gen, prompts))
+
+def _cover_base(img: Image.Image) -> Image.Image:
+    """Resize-cover anh ve khung lon hon frame (de con bien Ken Burns)."""
+    BW, BH = int(AW * KB_Z), int(AH * KB_Z)
+    iw, ih = img.size
+    scale = max(BW / iw, BH / ih)
+    img = img.resize((int(iw * scale) + 1, int(ih * scale) + 1), Image.BILINEAR)
+    iw, ih = img.size
+    left = (iw - BW) // 2; top = (ih - BH) // 2
+    return img.crop((left, top, left + BW, top + BH))
+
+def _kb_frame(base: Image.Image, p: float, preset) -> Image.Image:
+    """Cat 1 cua so zoom/pan tu base theo tien do p -> resize ve (AW, AH)."""
+    BW, BH = base.size
+    fx0, fy0, fx1, fy1, zin = preset
+    vf = _lerp(1.0, 0.85, p) if zin else _lerp(0.85, 1.0, p)
+    vis_w = vf * BW; vis_h = vf * BH
+    mx = BW - vis_w; my = BH - vis_h
+    x = mx * _lerp(fx0, fx1, p); y = my * _lerp(fy0, fy1, p)
+    return base.crop((int(x), int(y), int(x + vis_w), int(y + vis_h))).resize((AW, AH), Image.BILINEAR)
+
+def _build_anim_make_frame(scenes, captions, duration, product_name):
+    """Tra ve make_frame: Ken Burns + crossfade giua canh + caption fade-in."""
+    bases = [_cover_base(s) for s in scenes]
+    n_s = len(bases); n_c = max(1, len(captions))
+    sdur = duration / n_s; cdur = duration / n_c
+    td = min(0.5, sdur * 0.4)
+
+    scrim_h = 380
+    ys = (np.arange(scrim_h) / scrim_h) ** 1.4
+    scrim_arr = np.zeros((scrim_h, AW, 4), np.uint8)
+    scrim_arr[..., 3] = (210 * ys).astype(np.uint8)[:, None]
+    scrim = Image.fromarray(scrim_arr, "RGBA")
+    font_cap = _get_font(40)
+    font_pn = _get_font(22)
+
+    def scene_at(t):
+        si = min(int(t / sdur), n_s - 1)
+        p = (t - si * sdur) / sdur
+        f = _kb_frame(bases[si], min(p, 1.0), KB_PRESETS[si % len(KB_PRESETS)])
+        s_end = (si + 1) * sdur
+        if si < n_s - 1 and t > s_end - td:
+            a = (t - (s_end - td)) / td
+            nf = _kb_frame(bases[si + 1], 0.0, KB_PRESETS[(si + 1) % len(KB_PRESETS)])
+            f = Image.blend(f, nf, a)
+        return f
+
+    def make_frame(t):
+        base = scene_at(t).convert("RGBA")
+        base.alpha_composite(scrim, (0, AH - scrim_h))
+        draw = ImageDraw.Draw(base)
+        ci = min(int(t / cdur), n_c - 1)
+        cp = (t - ci * cdur) / cdur
+        alpha = min(1.0, cp / 0.2)
+        wrapped = textwrap.wrap(captions[ci], width=18)
+        line_h = 52
+        y = AH - 70 - len(wrapped) * line_h
+        tc = (255, 255, 255, int(255 * alpha)); sc = (0, 0, 0, int(180 * alpha))
+        for ln in wrapped:
+            try:
+                draw.text((AW // 2 + 2, y + 2), ln, font=font_cap, fill=sc, anchor="mm")
+                draw.text((AW // 2, y), ln, font=font_cap, fill=tc, anchor="mm")
+            except TypeError:
+                draw.text((30, y), ln, font=font_cap, fill=tc)
+            y += line_h
+        if product_name:
+            label = product_name[:40] + "…" if len(product_name) > 40 else product_name
+            try:
+                draw.text((AW // 2, AH - scrim_h + 34), label, font=font_pn,
+                          fill=(220, 220, 220, 230), anchor="mm")
+            except TypeError:
+                pass
+        return np.array(base.convert("RGB"))
+
+    return make_frame
+
+
 class VideoRequest(BaseModel):
     script: str
     voice: str = "nova"
@@ -690,14 +832,10 @@ async def generate_video(req: VideoRequest):
         raise HTTPException(status_code=400, detail="Script trống")
 
     captions = _parse_captions(req.script)
+    # So canh AI = ceil(captions/4), gioi han 2..4 de kiem soat chi phi + thoi gian
+    n_scene = max(2, min(4, -(-len(captions) // 4)))
 
-    try:
-        audio_bytes = _synth_video_audio(req.script, req.voice)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi TTS: {e}")
-
+    # Tai anh san pham that (neu co) -> dung lam canh cuoi (product reveal)
     img_bytes = None
     if req.product_image_url:
         try:
@@ -707,6 +845,30 @@ async def generate_video(req: VideoRequest):
                     img_bytes = r.content
         except:
             pass
+
+    # Chay song song: tong hop audio (da/don giong) + sinh anh canh bang AI
+    try:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_audio = ex.submit(_synth_video_audio, req.script, req.voice)
+            f_scenes = ex.submit(
+                lambda: _gen_scene_images(_gen_scene_prompts(req.script, req.product_name, n_scene))
+            )
+            audio_bytes = f_audio.result()
+            scenes = f_scenes.result()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi chuẩn bị nội dung: {e}")
+
+    # Thay canh sinh loi bang gradient du phong -> luon du canh, khong 500
+    scenes = [s if s is not None else _fallback_scene(i) for i, s in enumerate(scenes)]
+    if img_bytes:
+        try:
+            scenes.append(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
+        except Exception:
+            pass
+    if not scenes:
+        scenes = [_fallback_scene(0)]
 
     with tempfile.TemporaryDirectory() as tmp:
         audio_path = os.path.join(tmp, "audio.mp3")
@@ -721,26 +883,14 @@ async def generate_video(req: VideoRequest):
             audio_clip = AudioFileClip(audio_path)
             duration = audio_clip.duration
 
-            bg_arr = _build_bg(img_bytes)
-            n = max(1, len(captions))
-            time_per = duration / n
-
-            # Render từng khung theo thời gian (make_frame) để chỉ giữ 1 khung
-            # trong RAM tại một thời điểm -> tránh OOM trên free tier 512MB.
-            _cache = {"idx": -1, "frame": None}
-            def make_frame(t):
-                idx = min(int(t / time_per), n - 1)
-                if idx != _cache["idx"]:
-                    _cache["idx"] = idx
-                    _cache["frame"] = _render_slide(bg_arr, captions[idx], req.product_name)
-                return _cache["frame"]
+            # Ken Burns (zoom/pan) tren anh AI + crossfade + caption fade-in.
+            # make_frame chi giu 1 khung trong RAM -> nhe cho free tier.
+            make_frame = _build_anim_make_frame(scenes, captions, duration, req.product_name)
 
             video = VideoClip(make_frame, duration=duration)
             video = video.set_audio(audio_clip)
-            # fps thap (12) vi video la slideshow tinh, khong co chuyen dong
-            # -> giam mot nua so khung phai encode, nhanh hon nhieu.
             video.write_videofile(
-                video_path, fps=12, codec="libx264", audio_codec="aac",
+                video_path, fps=20, codec="libx264", audio_codec="aac",
                 preset="ultrafast", threads=2,
                 temp_audiofile=os.path.join(tmp, "tmp_audio.m4a"),
                 remove_temp=True, logger=None
