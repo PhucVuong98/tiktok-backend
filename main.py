@@ -11,6 +11,7 @@ import json
 import random
 import textwrap
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from openai import OpenAI
@@ -659,14 +660,17 @@ def _synth_video_audio(script: str, default_voice: str) -> bytes:
             voice = char_voice_map[char_name]
         parsed.append((text, voice))
 
-    # Hoi thoai: >=2 dong co tag nhan vat -> ghep da giong
+    # Hoi thoai: >=2 dong co tag nhan vat -> ghep da giong.
+    # Goi TTS song song (giu nguyen thu tu) de giam thoi gian cho.
     if len(parsed) >= 2:
-        parts = []
-        for text, voice in parsed:
+        def _tts(item):
+            text, voice = item
             resp = openai_client.audio.speech.create(
                 model="tts-1", voice=voice, input=text, response_format="mp3"
             )
-            parts.append(resp.content)
+            return resp.content
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            parts = list(ex.map(_tts, parsed))
         return b''.join(parts)
 
     # Script don -> 1 giong
@@ -733,8 +737,10 @@ async def generate_video(req: VideoRequest):
 
             video = VideoClip(make_frame, duration=duration)
             video = video.set_audio(audio_clip)
+            # fps thap (12) vi video la slideshow tinh, khong co chuyen dong
+            # -> giam mot nua so khung phai encode, nhanh hon nhieu.
             video.write_videofile(
-                video_path, fps=24, codec="libx264", audio_codec="aac",
+                video_path, fps=12, codec="libx264", audio_codec="aac",
                 preset="ultrafast", threads=2,
                 temp_audiofile=os.path.join(tmp, "tmp_audio.m4a"),
                 remove_temp=True, logger=None
