@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -15,6 +15,7 @@ import random
 import textwrap
 import tempfile
 import threading
+import queue as _queue
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -22,13 +23,27 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
+from auth_credits import require_uid, get_credits, reserve_credit, refund_credit
+
 load_dotenv()
+
+# Gia credit cho 1 lan tao video. Doi qua env neu sau nay can.
+VIDEO_CREDIT_COST = int(os.getenv("VIDEO_CREDIT_COST", "1"))
+
+# MOCK_RENDER=1: tao video GIA bang PIL/moviepy, KHONG goi OpenAI (LLM/TTS/image).
+# Dung de test luong queue/credit/poll/download ma khong ton phi. Mac dinh TAT.
+MOCK_RENDER = os.getenv("MOCK_RENDER", "").lower() in ("1", "true", "yes")
 
 app = FastAPI(title="TikTok AI Script Factory")
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "TikTok AI Script Factory"}
+    return {"status": "ok", "service": "TikTok AI Script Factory", "mock_render": MOCK_RENDER}
+
+@app.get("/api/me")
+def me(uid: str = Depends(require_uid)):
+    """Thong tin tai khoan dang nhap: so credit con lai (frontend hien thi + chan nut)."""
+    return {"uid": uid, "credits": get_credits(uid)}
 
 app.add_middleware(
     CORSMiddleware,
@@ -224,7 +239,7 @@ def get_trending_hooks(category: str = "Tất cả"):
     return [h for h in _hooks_cache if h.get("category") == category]
 
 @app.post("/api/ai-update-trends")
-def ai_update_trends():
+def ai_update_trends(uid: str = Depends(require_uid)):
     global _hooks_cache
     new_hooks = _generate_hooks_from_ai()
     if not new_hooks:
@@ -241,7 +256,7 @@ class ScriptRequest(BaseModel):
     tone: str
 
 @app.post("/api/generate-script")
-async def generate_script(req: ScriptRequest):
+async def generate_script(req: ScriptRequest, uid: str = Depends(require_uid)):
     if not req.product_url:
         raise HTTPException(status_code=400, detail="Vui lòng nhập link sản phẩm")
 
@@ -283,7 +298,7 @@ class PersonaScriptRequest(BaseModel):
     product_url: str
 
 @app.post("/api/generate-persona-scripts")
-async def generate_persona_scripts(req: PersonaScriptRequest):
+async def generate_persona_scripts(req: PersonaScriptRequest, uid: str = Depends(require_uid)):
     if not req.product_url:
         raise HTTPException(status_code=400, detail="Vui lòng nhập link sản phẩm")
 
@@ -384,7 +399,7 @@ class VoiceRequest(BaseModel):
     voice: str = "nova"  # nova, alloy, onyx, echo, fable, shimmer
 
 @app.post("/api/generate-voice")
-async def generate_voice(req: VoiceRequest):
+async def generate_voice(req: VoiceRequest, uid: str = Depends(require_uid)):
     if not req.script:
         raise HTTPException(status_code=400, detail="Kịch bản trống")
 
@@ -429,7 +444,7 @@ class DialogueVoiceRequest(BaseModel):
     dialogue: str
 
 @app.post("/api/generate-dialogue")
-async def generate_dialogue(req: DialogueRequest):
+async def generate_dialogue(req: DialogueRequest, uid: str = Depends(require_uid)):
     if not req.product_url:
         raise HTTPException(status_code=400, detail="Vui lòng nhập link sản phẩm")
 
@@ -477,7 +492,7 @@ Viết khoảng 12-16 dòng thoại.""",
 
 
 @app.post("/api/generate-dialogue-voice")
-async def generate_dialogue_voice(req: DialogueVoiceRequest):
+async def generate_dialogue_voice(req: DialogueVoiceRequest, uid: str = Depends(require_uid)):
     if not req.dialogue:
         raise HTTPException(status_code=400, detail="Kịch bản trống")
 
@@ -1198,20 +1213,69 @@ def _build_video_sync(req: VideoRequest) -> bytes:
     return mp4
 
 
+def _build_mock_video(req: VideoRequest) -> bytes:
+    """MOCK: tao MP4 hop le nhung KHONG goi OpenAI (khong LLM/TTS/anh AI).
+    Dung cac canh gradient du phong (_fallback_scene) + caption tu chinh script,
+    khong audio -> render rat nhanh, $0. Bat bang env MOCK_RENDER=1.
+    Caption gan tien to [MOCK] de khong nham la video that."""
+    captions = [f"[MOCK] {c}" for c in (_parse_captions(req.script)[:6] or ["Mock video"])]
+    scenes = [_fallback_scene(i) for i in range(3)]
+    duration = max(3.0, min(8.0, len(captions) * 1.2))
+    make_frame = _build_anim_make_frame(
+        scenes, captions, duration, req.product_name or "MOCK PRODUCT",
+        characters=None, caption_speakers=None,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        video_path = os.path.join(tmp, "video.mp4")
+        from moviepy.editor import VideoClip
+        video = VideoClip(make_frame, duration=duration)
+        video.write_videofile(
+            video_path, fps=12, codec="libx264", audio=False,
+            preset="ultrafast", threads=2, logger=None,
+        )
+        with open(video_path, "rb") as f:
+            mp4 = f.read()
+        video.close()
+    return mp4
+
+
 # =========================================================================
-# JOB BAT DONG BO — POST tra ngay job_id, frontend poll trang thai roi tai ket qua.
-# Tranh gioi han ~100s edge timeout cua Cloudflare/Render cho video dai.
-# Luu trong RAM (free tier chi 1 worker). Job tu het han sau JOB_TTL.
+# JOB BAT DONG BO + HANG DOI CO GIOI HAN (bounded queue)
+# POST tra ngay job_id -> frontend poll status -> tai result. Ne edge timeout ~100s.
+#
+# Khac ban cu (de chay SaaS that, khong sap khi dong user tren free tier):
+#  - Render TUAN TU qua hang doi (MAX_WORKERS, free tier = 1) thay vi de-thread vo
+#    han -> tranh OOM khi nhieu nguoi bam cung luc.
+#  - Tu choi (503) khi hang doi qua MAX_QUEUE -> co backpressure, khong nhan vo han.
+#  - MP4 ket qua luu xuong DISK (khong giu bytes trong RAM) -> nhe RAM 512MB.
+#  - Tra them `position` (vi tri xep hang) cho frontend hien thi.
 # =========================================================================
-_jobs: dict = {}
+_RESULT_DIR = os.path.join(tempfile.gettempdir(), "tiktok_jobs")
+os.makedirs(_RESULT_DIR, exist_ok=True)
+
+JOB_TTL = 1800                                          # 30 phut: don job + file cu
+MAX_WORKERS = int(os.getenv("VIDEO_WORKERS", "1"))      # so video render dong thoi (free tier nen = 1)
+MAX_QUEUE = int(os.getenv("VIDEO_QUEUE_MAX", "20"))     # so job cho toi da truoc khi tu choi
+
+_jobs: dict = {}                  # job_id -> {status, error, path, ts}
 _jobs_lock = threading.Lock()
-JOB_TTL = 1800  # 30 phut
+_job_q: "_queue.Queue[str]" = _queue.Queue()
+_job_reqs: dict = {}              # job_id -> VideoRequest (tach khoi _jobs)
+
 
 def _cleanup_jobs():
     now = time.time()
     with _jobs_lock:
-        for k in [k for k, v in _jobs.items() if now - v["ts"] > JOB_TTL]:
-            _jobs.pop(k, None)
+        stale = [k for k, v in _jobs.items() if now - v["ts"] > JOB_TTL]
+        for k in stale:
+            v = _jobs.pop(k, None)
+            _job_reqs.pop(k, None)
+            if v and v.get("path") and os.path.exists(v["path"]):
+                try:
+                    os.remove(v["path"])
+                except OSError:
+                    pass
+
 
 def _set_job(job_id: str, **fields):
     with _jobs_lock:
@@ -1219,55 +1283,99 @@ def _set_job(job_id: str, **fields):
             _jobs[job_id].update(fields)
             _jobs[job_id]["ts"] = time.time()
 
-def _run_video_job(job_id: str, req: VideoRequest):
-    _set_job(job_id, status="processing")
-    try:
-        mp4 = _build_video_sync(req)
-        _set_job(job_id, status="done", mp4=mp4)
-    except Exception as e:
-        _set_job(job_id, status="error", error=str(e) or "Lỗi không xác định")
+
+def _video_worker():
+    """Worker chay mai mai: lay job tu hang doi va render TUAN TU.
+    So worker = MAX_WORKERS gioi han so video render dong thoi -> bao ve RAM/CPU free tier."""
+    while True:
+        job_id = _job_q.get()
+        try:
+            req = _job_reqs.get(job_id)
+            if req is None:               # job da bi don (het han) truoc khi toi luot
+                continue
+            _set_job(job_id, status="processing")
+            mp4 = _build_mock_video(req) if MOCK_RENDER else _build_video_sync(req)
+            path = os.path.join(_RESULT_DIR, f"{job_id}.mp4")
+            with open(path, "wb") as f:
+                f.write(mp4)
+            _set_job(job_id, status="done", path=path)
+        except Exception as e:
+            _set_job(job_id, status="error", error=str(e) or "Lỗi không xác định")
+            # Render that bai -> hoan lai credit da tru cho user (cong bang, ko mat tien oan).
+            with _jobs_lock:
+                job = _jobs.get(job_id) or {}
+            if job.get("uid") and job.get("cost"):
+                refund_credit(job["uid"], job["cost"])
+        finally:
+            _job_reqs.pop(job_id, None)
+            _job_q.task_done()
+
+
+# Khoi dong pool worker co dinh ngay khi import module (1 worker tren free tier).
+for _ in range(max(1, MAX_WORKERS)):
+    threading.Thread(target=_video_worker, daemon=True).start()
 
 
 @app.post("/api/generate-video")
-def generate_video(req: VideoRequest):
-    """Khoi tao job tao video, tra ngay job_id (khong cho render xong)."""
+def generate_video(req: VideoRequest, uid: str = Depends(require_uid)):
+    """Khoi tao job tao video, tra ngay job_id (khong cho render xong).
+    TRU credit truoc khi nhan job (atomic) -> ko du thi tu choi 402. Worker hoan lai neu loi."""
     if not req.script:
         raise HTTPException(status_code=400, detail="Script trống")
     _cleanup_jobs()
+    if _job_q.qsize() >= MAX_QUEUE:
+        raise HTTPException(
+            status_code=503,
+            detail="Hệ thống đang quá tải, nhiều video đang chờ. Thử lại sau ít phút nhé."
+        )
+    # Tru credit truoc — neu het, KHONG nhan job (tranh tao video roi moi phat hien het tien).
+    if not reserve_credit(uid, VIDEO_CREDIT_COST):
+        raise HTTPException(
+            status_code=402,
+            detail="Bạn đã hết credit. Nâng cấp gói để tạo thêm video nhé."
+        )
     job_id = uuid.uuid4().hex
     with _jobs_lock:
-        _jobs[job_id] = {"status": "pending", "mp4": None, "error": None, "ts": time.time()}
-    threading.Thread(target=_run_video_job, args=(job_id, req), daemon=True).start()
+        _jobs[job_id] = {
+            "status": "pending", "error": None, "path": None,
+            "ts": time.time(), "uid": uid, "cost": VIDEO_CREDIT_COST,
+        }
+        _job_reqs[job_id] = req
+    _job_q.put(job_id)
     return {"job_id": job_id, "status": "pending"}
 
 
 @app.get("/api/video-status/{job_id}")
 def video_status(job_id: str):
-    """Hoi trang thai job: pending | processing | done | error."""
+    """Hoi trang thai job: pending | processing | done | error.
+    Khi pending, tra them `position` = vi tri trong hang doi (1 = ke tiep)."""
     with _jobs_lock:
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job không tồn tại hoặc đã hết hạn")
-        return {"status": job["status"], "error": job["error"]}
+        status, error = job["status"], job["error"]
+    position = None
+    if status == "pending":
+        try:
+            position = list(_job_q.queue).index(job_id) + 1
+        except ValueError:
+            position = None
+    return {"status": status, "error": error, "position": position}
 
 
 @app.get("/api/video-result/{job_id}")
 def video_result(job_id: str):
-    """Tai MP4 khi job xong. Lay xong thi xoa khoi RAM."""
+    """Tai MP4 khi job xong (doc tu disk). File tu het han theo JOB_TTL."""
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job không tồn tại hoặc đã hết hạn")
     if job["status"] == "error":
         raise HTTPException(status_code=500, detail=job["error"] or "Lỗi tạo video")
-    if job["status"] != "done" or not job["mp4"]:
+    if job["status"] != "done" or not job.get("path") or not os.path.exists(job["path"]):
         raise HTTPException(status_code=409, detail="Video chưa sẵn sàng")
-    mp4 = job["mp4"]
-    with _jobs_lock:
-        _jobs.pop(job_id, None)
-    return StreamingResponse(
-        io.BytesIO(mp4), media_type="video/mp4",
-        headers={"Content-Disposition": 'attachment; filename="tiktok_video.mp4"'}
+    return FileResponse(
+        job["path"], media_type="video/mp4", filename="tiktok_video.mp4"
     )
 
 

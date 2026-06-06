@@ -9,3 +9,4 @@ beautifulsoup4
 moviepy==1.0.3
 Pillow
 numpy
+firebase-admin
