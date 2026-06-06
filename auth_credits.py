@@ -43,10 +43,18 @@ def _get_db():
             try:
                 if sa_json:
                     cred = credentials.Certificate(json.loads(sa_json))
-                else:
+                elif os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
                     # Dua vao GOOGLE_APPLICATION_CREDENTIALS (Application Default Credentials)
                     cred = credentials.ApplicationDefault()
+                else:
+                    # Thieu hoan toan cau hinh -> bao loi RO RANG ngay (tranh 401 kho hieu sau nay).
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Backend chưa cấu hình Firebase: thiếu env FIREBASE_SERVICE_ACCOUNT_JSON.",
+                    )
                 firebase_admin.initialize_app(cred)
+            except HTTPException:
+                raise
             except Exception as e:
                 raise HTTPException(
                     status_code=503,
