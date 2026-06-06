@@ -37,6 +37,16 @@ app.add_middleware(
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Warm-up các submodule lazy của openai SDK ngay trong main thread lúc khởi động.
+# Nếu để các worker thread (ThreadPoolExecutor ở generate_video) cùng truy cập
+# openai_client.chat / .audio / .images lần đầu một cách song song, Python import-lock
+# sẽ kẹt chéo -> deadlock (_ModuleLock('openai.resources.chat')).
+_ = (
+    openai_client.chat.completions,
+    openai_client.audio.speech,
+    openai_client.images,
+)
+
 # =========================================================================
 # AI VOICE PERSONAS — Nhân vật AI có phong cách riêng
 # =========================================================================
