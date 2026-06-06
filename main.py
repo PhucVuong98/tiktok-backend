@@ -723,8 +723,14 @@ def _kb_frame(base: Image.Image, p: float, preset) -> Image.Image:
     x = mx * _lerp(fx0, fx1, p); y = my * _lerp(fy0, fy1, p)
     return base.crop((int(x), int(y), int(x + vis_w), int(y + vis_h))).resize((AW, AH), Image.BILINEAR)
 
-def _build_anim_make_frame(scenes, captions, duration, product_name):
-    """Tra ve make_frame: Ken Burns + crossfade giua canh + caption fade-in."""
+AV_R = 40                       # ban kinh avatar
+AV_COLORS = [(244, 63, 94), (56, 189, 248)]   # A = hong, B = xanh
+
+def _build_anim_make_frame(scenes, captions, duration, product_name,
+                           avatars=None, caption_speakers=None):
+    """Tra ve make_frame: Ken Burns + crossfade + caption + avatar 2 nhan vat.
+    avatars: list dict {name, initial, color}. caption_speakers: ten nguoi noi moi caption
+    (de lam sang avatar dang noi)."""
     bases = [_cover_base(s) for s in scenes]
     n_s = len(bases); n_c = max(1, len(captions))
     sdur = duration / n_s; cdur = duration / n_c
@@ -737,6 +743,26 @@ def _build_anim_make_frame(scenes, captions, duration, product_name):
     scrim = Image.fromarray(scrim_arr, "RGBA")
     font_cap = _get_font(40)
     font_pn = _get_font(22)
+    font_av = _get_font(36)     # chu cai dau trong avatar
+    font_avn = _get_font(20)    # ten duoi avatar
+
+    av_cy = AH - scrim_h + 84
+    av_pos = [int(AW * 0.24), int(AW * 0.76)]   # A trai, B phai
+
+    def _draw_avatars(draw, active_name):
+        for av, cx in zip(avatars, av_pos):
+            active = active_name is not None and av["name"] == active_name
+            col = av["color"] if active else tuple(int(c * 0.4) for c in av["color"])
+            if active:   # vien sang cho nguoi dang noi
+                draw.ellipse([cx - AV_R - 5, av_cy - AV_R - 5, cx + AV_R + 5, av_cy + AV_R + 5],
+                             outline=(255, 255, 255, 255), width=4)
+            draw.ellipse([cx - AV_R, av_cy - AV_R, cx + AV_R, av_cy + AV_R], fill=col + (255,))
+            tcol = (255, 255, 255, 255) if active else (170, 170, 170, 255)
+            try:
+                draw.text((cx, av_cy), av["initial"], font=font_av, fill=tcol, anchor="mm")
+                draw.text((cx, av_cy + AV_R + 16), av["name"][:16], font=font_avn, fill=tcol, anchor="mm")
+            except TypeError:
+                pass
 
     def scene_at(t):
         si = min(int(t / sdur), n_s - 1)
@@ -756,9 +782,23 @@ def _build_anim_make_frame(scenes, captions, duration, product_name):
         ci = min(int(t / cdur), n_c - 1)
         cp = (t - ci * cdur) / cdur
         alpha = min(1.0, cp / 0.2)
-        wrapped = textwrap.wrap(captions[ci], width=18)
-        line_h = 52
-        y = AH - 70 - len(wrapped) * line_h
+
+        # Avatar 2 nhan vat (sang nguoi dang noi)
+        if avatars:
+            spk = caption_speakers[ci] if caption_speakers and ci < len(caption_speakers) else None
+            _draw_avatars(draw, spk)
+        elif product_name:
+            label = product_name[:40] + "…" if len(product_name) > 40 else product_name
+            try:
+                draw.text((AW // 2, AH - scrim_h + 34), label, font=font_pn,
+                          fill=(220, 220, 220, 230), anchor="mm")
+            except TypeError:
+                pass
+
+        # Caption (toi da 3 dong de khong de len avatar)
+        wrapped = textwrap.wrap(captions[ci], width=18)[:3]
+        line_h = 50
+        y = AH - 60 - len(wrapped) * line_h
         tc = (255, 255, 255, int(255 * alpha)); sc = (0, 0, 0, int(180 * alpha))
         for ln in wrapped:
             try:
@@ -767,13 +807,7 @@ def _build_anim_make_frame(scenes, captions, duration, product_name):
             except TypeError:
                 draw.text((30, y), ln, font=font_cap, fill=tc)
             y += line_h
-        if product_name:
-            label = product_name[:40] + "…" if len(product_name) > 40 else product_name
-            try:
-                draw.text((AW // 2, AH - scrim_h + 34), label, font=font_pn,
-                          fill=(220, 220, 220, 230), anchor="mm")
-            except TypeError:
-                pass
+
         return np.array(base.convert("RGB"))
 
     return make_frame
@@ -825,8 +859,15 @@ Yêu cầu:
     return raw.strip()
 
 
+def _avatar_initial(name: str) -> str:
+    """Lay chu cai dau (in hoa) cua ten nhan vat de hien trong avatar."""
+    for ch in name:
+        if ch.isalnum():
+            return ch.upper()
+    return "?"
+
 def _parse_dialogue_captions(dialogue: str) -> list:
-    """Moi luot thoai -> caption (chia nho neu dai), kem ten nguoi noi o dau luot."""
+    """Moi luot thoai -> 1 hoac nhieu (ten_nguoi_noi, caption). Chia nho luot dai."""
     line_pattern = re.compile(r'^\[(.+?)(?:\|(\w+))?\]:\s*(.+)$')
     caps = []
     for raw in dialogue.strip().split('\n'):
@@ -836,13 +877,14 @@ def _parse_dialogue_captions(dialogue: str) -> list:
         name = m.group(1).strip()
         text = m.group(3).strip()
         words = text.split()
-        if len(words) > 12:
-            for i in range(0, len(words), 11):
-                chunk = ' '.join(words[i:i + 11])
-                caps.append(f"{name}: {chunk}" if i == 0 else chunk)
+        if len(words) > 11:
+            for i in range(0, len(words), 10):
+                caps.append((name, ' '.join(words[i:i + 10])))
         else:
-            caps.append(f"{name}: {text}")
-    return caps or _parse_captions(dialogue)
+            caps.append((name, text))
+    if not caps:
+        return [(None, c) for c in _parse_captions(dialogue)]
+    return caps
 
 
 def _synth_video_audio(script: str, default_voice: str) -> bytes:
@@ -913,7 +955,13 @@ def _build_video_sync(req: VideoRequest) -> bytes:
     # Buoc 1: chuyen kich ban doc 1 giong -> hoi thoai 2 nhan vat
     dialogue = _scriptify_to_dialogue(req.script, req.product_name, persona_a, persona_b)
 
-    captions = _parse_dialogue_captions(dialogue)
+    caps = _parse_dialogue_captions(dialogue)
+    captions = [t for _, t in caps]
+    caption_speakers = [n for n, _ in caps]
+    avatars = [
+        {"name": persona_a["name"], "initial": _avatar_initial(persona_a["name"]), "color": AV_COLORS[0]},
+        {"name": persona_b["name"], "initial": _avatar_initial(persona_b["name"]), "color": AV_COLORS[1]},
+    ]
     # So canh AI = ceil(captions/4), gioi han 2..3 de kiem soat chi phi
     n_scene = max(2, min(3, -(-len(captions) // 4)))
 
@@ -962,7 +1010,10 @@ def _build_video_sync(req: VideoRequest) -> bytes:
 
         # Ken Burns (zoom/pan) tren anh AI + crossfade + caption fade-in.
         # make_frame chi giu 1 khung trong RAM -> nhe cho free tier.
-        make_frame = _build_anim_make_frame(scenes, captions, duration, req.product_name)
+        make_frame = _build_anim_make_frame(
+            scenes, captions, duration, req.product_name,
+            avatars=avatars, caption_speakers=caption_speakers,
+        )
 
         video = VideoClip(make_frame, duration=duration)
         video = video.set_audio(audio_clip)
