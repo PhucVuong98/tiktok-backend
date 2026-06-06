@@ -962,6 +962,37 @@ Yêu cầu:
     return raw.strip()
 
 
+def _scriptify_to_review(script: str, product_name: str, persona: dict) -> str:
+    """Viet lai kich ban thanh loi REVIEW 1 nguoi noi, tu nhien, theo phong cach persona.
+    Tra ve text thuong (cau noi lien mach), KHONG marker/[..] de TTS + caption sach."""
+    excerpt = re.sub(r'\[.*?\]\s*:?', '', script).strip()[:1500]
+    raw = call_ai(
+        system=("Bạn là một TikTok reviewer Việt Nam nói chuyện tự nhiên, duyên dáng. "
+                "Chỉ trả về lời nói, không tiêu đề, không markdown, không ký hiệu trong ngoặc vuông."),
+        user=f"""Sản phẩm: "{product_name or 'sản phẩm'}"
+
+Kịch bản gốc cần viết lại:
+\"\"\"
+{excerpt}
+\"\"\"
+
+Hãy VIẾT LẠI thành lời tự review sản phẩm của MỘT người nói (first-person), nghe thật tự nhiên,
+như đang quay TikTok review thật, đúng phong cách nhân vật:
+
+Nhân vật — {persona['name']}: {persona['style']}
+
+Yêu cầu:
+- Một người nói liền mạch (không hội thoại, không tên người nói, không stage direction).
+- Giữ mạch: mở đầu nêu vấn đề/tình huống → giới thiệu sản phẩm như giải pháp → 1 câu chê nhỏ cho chân thật → kết bằng lời kêu gọi mua nhẹ nhàng.
+- Nói đúng phong cách nhân vật, dùng từ ngữ tự nhiên của họ.
+- Độ dài vừa phải cho video ~40-55 giây (khoảng 90-130 từ).
+- CHỈ trả về phần lời nói thuần, không ký hiệu [], không gạch đầu dòng.""",
+        temperature=0.85,
+    )
+    # Don sach phong khi model lo chen marker
+    return re.sub(r'\[.*?\]\s*:?', '', raw).strip()
+
+
 def _parse_dialogue_captions(dialogue: str) -> list:
     """Moi luot thoai -> 1 hoac nhieu (ten_nguoi_noi, caption). Chia nho luot dai."""
     line_pattern = re.compile(r'^\[(.+?)(?:\|(\w+))?\]:\s*(.+)$')
@@ -1075,12 +1106,14 @@ def _build_video_sync(req: VideoRequest) -> bytes:
     if single:
         # ===== MODE 1 NHAN VAT REVIEW =====
         persona = PERSONA_MAP.get(req.persona_a_id, VOICE_PERSONAS[0])
-        captions = _parse_captions(req.script)
+        # Viet lai script thanh loi review tu nhien theo phong cach persona
+        review = _scriptify_to_review(req.script, req.product_name, persona)
+        captions = _parse_captions(review)
         caption_speakers = None
         characters = None
         n_scene = max(2, min(3, -(-len(captions) // 4)))
         with ThreadPoolExecutor(max_workers=2) as ex:
-            f_audio = ex.submit(_synth_single_voice, req.script, persona["voice"])
+            f_audio = ex.submit(_synth_single_voice, review, persona["voice"])
             f_scenes = ex.submit(
                 lambda: _gen_scene_images(
                     _gen_scene_prompts(req.script, req.product_name, n_scene, product_focus=True))
