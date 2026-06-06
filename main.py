@@ -38,7 +38,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# timeout=90s + max_retries=1: khong de bat ky call OpenAI nao treo lau (truoc day
+# 1 call sinh anh treo ~10 phut khien ca job dung -> "Quá thời gian tạo video").
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=90.0, max_retries=1)
 
 # Warm-up các submodule lazy của openai SDK ngay trong main thread lúc khởi động.
 # Nếu để các worker thread (ThreadPoolExecutor ở generate_video) cùng truy cập
@@ -749,7 +751,8 @@ def _gen_persona_portrait(persona: dict):
                     f"modern social-media style, highly detailed. No text, no watermark."),
             size="1024x1024", quality="low", n=1,
         )
-        return Image.open(io.BytesIO(base64.b64decode(r.data[0].b64_json))).convert("RGB")
+        img = Image.open(io.BytesIO(base64.b64decode(r.data[0].b64_json))).convert("RGB")
+        return img.resize((256, 256), Image.LANCZOS)   # avatar nho -> tiet kiem RAM
     except Exception:
         return None
 
@@ -1094,7 +1097,7 @@ def _build_video_sync(req: VideoRequest) -> bytes:
         video = VideoClip(make_frame, duration=duration)
         video = video.set_audio(audio_clip)
         video.write_videofile(
-            video_path, fps=20, codec="libx264", audio_codec="aac",
+            video_path, fps=15, codec="libx264", audio_codec="aac",
             preset="ultrafast", threads=2,
             temp_audiofile=os.path.join(tmp, "tmp_audio.m4a"),
             remove_temp=True, logger=None
