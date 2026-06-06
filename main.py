@@ -781,9 +781,68 @@ def _build_anim_make_frame(scenes, captions, duration, product_name):
 
 class VideoRequest(BaseModel):
     script: str
-    voice: str = "nova"
+    voice: str = "nova"            # giữ để tương thích cũ; video giờ luôn hội thoại đa giọng
     product_image_url: str = ""
     product_name: str = ""
+    persona_a_id: str = "genz"     # nhân vật A (xem VOICE_PERSONAS)
+    persona_b_id: str = "cool"     # nhân vật B
+
+
+def _scriptify_to_dialogue(script: str, product_name: str,
+                           persona_a: dict, persona_b: dict) -> str:
+    """Chuyen kich ban doc 1 giong -> hoi thoai 2 nhan vat noi chuyen qua lai.
+    Tra ve text dinh dang moi dong [Ten|voice]: loi  (de _synth_video_audio ghep da giong).
+    """
+    # Bo cac marker dao dien [BOI CANH QUAY], [HOOK]... chi giu noi dung
+    excerpt = re.sub(r'\[.*?\]\s*:?', '', script).strip()[:1500]
+    raw = call_ai(
+        system="Bạn là biên kịch TikTok chuyên viết hội thoại tự nhiên, viral cho thị trường Việt Nam. Chỉ trả về các dòng thoại, không giải thích.",
+        user=f"""Sản phẩm: "{product_name or 'sản phẩm'}"
+
+Kịch bản gốc (dạng độc thoại) cần chuyển thể:
+\"\"\"
+{excerpt}
+\"\"\"
+
+Hãy CHUYỂN thành đoạn hội thoại TikTok giữa 2 nhân vật nói chuyện QUA LẠI với nhau,
+giữ nguyên thông điệp và mạch câu chuyện (vấn đề → giải pháp → lời kêu gọi mua).
+
+Nhân vật A — {persona_a['name']}: {persona_a['style']}
+Nhân vật B — {persona_b['name']}: {persona_b['style']}
+
+Yêu cầu:
+- Hai người ĐỐI THOẠI qua lại (hỏi - đáp, phản ứng), KHÔNG phải mỗi người đọc một đoạn dài.
+- Mỗi nhân vật nói đúng phong cách riêng, nghe khác biệt rõ.
+- Nửa đầu nêu vấn đề/tình huống, chưa khoe sản phẩm. Giữ 1 câu chê nhỏ cho chân thật.
+- Kết bằng lời kêu gọi mua nhẹ nhàng.
+- Khoảng 10-16 lượt thoại, mỗi lượt 1-2 câu ngắn gọn.
+
+Định dạng MỖI dòng ĐÚNG như sau (không markdown, không số thứ tự, không thêm gì khác):
+[{persona_a['name']}|{persona_a['voice']}]: lời thoại
+[{persona_b['name']}|{persona_b['voice']}]: lời thoại""",
+        temperature=0.85,
+    )
+    return raw.strip()
+
+
+def _parse_dialogue_captions(dialogue: str) -> list:
+    """Moi luot thoai -> caption (chia nho neu dai), kem ten nguoi noi o dau luot."""
+    line_pattern = re.compile(r'^\[(.+?)(?:\|(\w+))?\]:\s*(.+)$')
+    caps = []
+    for raw in dialogue.strip().split('\n'):
+        m = line_pattern.match(raw.strip())
+        if not m:
+            continue
+        name = m.group(1).strip()
+        text = m.group(3).strip()
+        words = text.split()
+        if len(words) > 12:
+            for i in range(0, len(words), 11):
+                chunk = ' '.join(words[i:i + 11])
+                caps.append(f"{name}: {chunk}" if i == 0 else chunk)
+        else:
+            caps.append(f"{name}: {text}")
+    return caps or _parse_captions(dialogue)
 
 
 def _synth_video_audio(script: str, default_voice: str) -> bytes:
@@ -842,8 +901,19 @@ def _synth_video_audio(script: str, default_voice: str) -> bytes:
 def _build_video_sync(req: VideoRequest) -> bytes:
     """Toan bo pipeline tao video, chay DONG BO trong 1 thread nen (worker job).
     Tra ve bytes MP4. Nem Exception (kem message) neu loi -> job luu vao status error.
+
+    Video luon o dang HOI THOAI: chuyen kich ban -> doan thoai 2 nhan vat, doc da giong.
     """
-    captions = _parse_captions(req.script)
+    persona_a = PERSONA_MAP.get(req.persona_a_id, VOICE_PERSONAS[0])
+    persona_b = PERSONA_MAP.get(req.persona_b_id, VOICE_PERSONAS[1])
+    # Neu chon trung 1 nhan vat -> ep B khac A de van co 2 giong
+    if persona_b["id"] == persona_a["id"]:
+        persona_b = next((p for p in VOICE_PERSONAS if p["id"] != persona_a["id"]), persona_b)
+
+    # Buoc 1: chuyen kich ban doc 1 giong -> hoi thoai 2 nhan vat
+    dialogue = _scriptify_to_dialogue(req.script, req.product_name, persona_a, persona_b)
+
+    captions = _parse_dialogue_captions(dialogue)
     # So canh AI = ceil(captions/4), gioi han 2..3 de kiem soat chi phi
     n_scene = max(2, min(3, -(-len(captions) // 4)))
 
@@ -858,9 +928,10 @@ def _build_video_sync(req: VideoRequest) -> bytes:
         except Exception:
             pass
 
-    # Chay song song: tong hop audio (da/don giong) + sinh anh canh bang AI
+    # Chay song song: tong hop audio hoi thoai (da giong) + sinh anh canh bang AI.
+    # Scene prompts dung kich ban GOC (con marker [BOI CANH QUAY]...) de co goi y hinh anh.
     with ThreadPoolExecutor(max_workers=2) as ex:
-        f_audio = ex.submit(_synth_video_audio, req.script, req.voice)
+        f_audio = ex.submit(_synth_video_audio, dialogue, persona_a["voice"])
         f_scenes = ex.submit(
             lambda: _gen_scene_images(_gen_scene_prompts(req.script, req.product_name, n_scene))
         )
