@@ -23,7 +23,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-from auth_credits import require_uid, get_credits, reserve_credit, refund_credit
+from auth_credits import require_uid, get_credits, reserve_credit, refund_credit, admin_project_id
 
 load_dotenv()
 
@@ -38,7 +38,12 @@ app = FastAPI(title="TikTok AI Script Factory")
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "TikTok AI Script Factory", "mock_render": MOCK_RENDER}
+    return {
+        "status": "ok",
+        "service": "TikTok AI Script Factory",
+        "mock_render": MOCK_RENDER,
+        "firebase_project": admin_project_id(),   # đối chiếu với project frontend (vincent-ai-tiktok)
+    }
 
 @app.get("/api/me")
 def me(uid: str = Depends(require_uid)):

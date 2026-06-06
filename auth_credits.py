@@ -68,9 +68,20 @@ def require_uid(authorization: Optional[str] = Header(default=None)) -> str:
         decoded = fb_auth.verify_id_token(token)
     except HTTPException:
         raise
-    except Exception:
-        raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ, đăng nhập lại nhé.")
+    except Exception as e:
+        # Kem ly do that (vd "incorrect audience" = service account khac project) de de chan doan.
+        raise HTTPException(status_code=401, detail=f"Token không hợp lệ: {e}")
     return decoded["uid"]
+
+
+def admin_project_id() -> str:
+    """Tra ve project_id ma firebase-admin dang dung (de doi chieu voi project frontend).
+    project_id KHONG phai bi mat -> an toan de lo ra cho chan doan."""
+    try:
+        _get_db()
+        return firebase_admin.get_app().project_id or "(khong xac dinh)"
+    except Exception as e:
+        return f"(init that bai: {e})"
 
 
 def get_credits(uid: str) -> int:
