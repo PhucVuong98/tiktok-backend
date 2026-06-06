@@ -8,10 +8,13 @@ import os
 import io
 import re
 import json
+import time
+import uuid
 import base64
 import random
 import textwrap
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -836,42 +839,35 @@ def _synth_video_audio(script: str, default_voice: str) -> bytes:
     return resp.content
 
 
-@app.post("/api/generate-video")
-async def generate_video(req: VideoRequest):
-    if not req.script:
-        raise HTTPException(status_code=400, detail="Script trống")
-
+def _build_video_sync(req: VideoRequest) -> bytes:
+    """Toan bo pipeline tao video, chay DONG BO trong 1 thread nen (worker job).
+    Tra ve bytes MP4. Nem Exception (kem message) neu loi -> job luu vao status error.
+    """
     captions = _parse_captions(req.script)
-    # So canh AI = ceil(captions/4), gioi han 2..3 de kiem soat chi phi + thoi gian
-    # (moi anh gpt-image-1 ton ~15-25s, giam toi da 3 de tong thoi gian < 100s edge timeout)
+    # So canh AI = ceil(captions/4), gioi han 2..3 de kiem soat chi phi
     n_scene = max(2, min(3, -(-len(captions) // 4)))
 
     # Tai anh san pham that (neu co) -> dung lam canh cuoi (product reveal)
     img_bytes = None
     if req.product_image_url:
         try:
-            async with httpx.AsyncClient(timeout=8) as c:
-                r = await c.get(req.product_image_url)
+            with httpx.Client(timeout=8) as c:
+                r = c.get(req.product_image_url)
                 if r.status_code == 200:
                     img_bytes = r.content
-        except:
+        except Exception:
             pass
 
     # Chay song song: tong hop audio (da/don giong) + sinh anh canh bang AI
-    try:
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f_audio = ex.submit(_synth_video_audio, req.script, req.voice)
-            f_scenes = ex.submit(
-                lambda: _gen_scene_images(_gen_scene_prompts(req.script, req.product_name, n_scene))
-            )
-            audio_bytes = f_audio.result()
-            scenes = f_scenes.result()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi chuẩn bị nội dung: {e}")
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_audio = ex.submit(_synth_video_audio, req.script, req.voice)
+        f_scenes = ex.submit(
+            lambda: _gen_scene_images(_gen_scene_prompts(req.script, req.product_name, n_scene))
+        )
+        audio_bytes = f_audio.result()
+        scenes = f_scenes.result()
 
-    # Thay canh sinh loi bang gradient du phong -> luon du canh, khong 500
+    # Thay canh sinh loi bang gradient du phong -> luon du canh
     scenes = [s if s is not None else _fallback_scene(i) for i, s in enumerate(scenes)]
     if img_bytes:
         try:
@@ -888,33 +884,100 @@ async def generate_video(req: VideoRequest):
         with open(audio_path, "wb") as f:
             f.write(audio_bytes)
 
-        try:
-            from moviepy.editor import VideoClip, AudioFileClip
+        from moviepy.editor import VideoClip, AudioFileClip
 
-            audio_clip = AudioFileClip(audio_path)
-            duration = audio_clip.duration
+        audio_clip = AudioFileClip(audio_path)
+        duration = audio_clip.duration
 
-            # Ken Burns (zoom/pan) tren anh AI + crossfade + caption fade-in.
-            # make_frame chi giu 1 khung trong RAM -> nhe cho free tier.
-            make_frame = _build_anim_make_frame(scenes, captions, duration, req.product_name)
+        # Ken Burns (zoom/pan) tren anh AI + crossfade + caption fade-in.
+        # make_frame chi giu 1 khung trong RAM -> nhe cho free tier.
+        make_frame = _build_anim_make_frame(scenes, captions, duration, req.product_name)
 
-            video = VideoClip(make_frame, duration=duration)
-            video = video.set_audio(audio_clip)
-            video.write_videofile(
-                video_path, fps=14, codec="libx264", audio_codec="aac",
-                preset="ultrafast", threads=2,
-                temp_audiofile=os.path.join(tmp, "tmp_audio.m4a"),
-                remove_temp=True, logger=None
-            )
+        video = VideoClip(make_frame, duration=duration)
+        video = video.set_audio(audio_clip)
+        video.write_videofile(
+            video_path, fps=20, codec="libx264", audio_codec="aac",
+            preset="ultrafast", threads=2,
+            temp_audiofile=os.path.join(tmp, "tmp_audio.m4a"),
+            remove_temp=True, logger=None
+        )
 
-            with open(video_path, "rb") as f:
-                mp4 = f.read()
+        with open(video_path, "rb") as f:
+            mp4 = f.read()
 
-            video.close()
-            audio_clip.close()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Lỗi render video: {e}")
+        video.close()
+        audio_clip.close()
 
+    return mp4
+
+
+# =========================================================================
+# JOB BAT DONG BO — POST tra ngay job_id, frontend poll trang thai roi tai ket qua.
+# Tranh gioi han ~100s edge timeout cua Cloudflare/Render cho video dai.
+# Luu trong RAM (free tier chi 1 worker). Job tu het han sau JOB_TTL.
+# =========================================================================
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
+JOB_TTL = 1800  # 30 phut
+
+def _cleanup_jobs():
+    now = time.time()
+    with _jobs_lock:
+        for k in [k for k, v in _jobs.items() if now - v["ts"] > JOB_TTL]:
+            _jobs.pop(k, None)
+
+def _set_job(job_id: str, **fields):
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id].update(fields)
+            _jobs[job_id]["ts"] = time.time()
+
+def _run_video_job(job_id: str, req: VideoRequest):
+    _set_job(job_id, status="processing")
+    try:
+        mp4 = _build_video_sync(req)
+        _set_job(job_id, status="done", mp4=mp4)
+    except Exception as e:
+        _set_job(job_id, status="error", error=str(e) or "Lỗi không xác định")
+
+
+@app.post("/api/generate-video")
+def generate_video(req: VideoRequest):
+    """Khoi tao job tao video, tra ngay job_id (khong cho render xong)."""
+    if not req.script:
+        raise HTTPException(status_code=400, detail="Script trống")
+    _cleanup_jobs()
+    job_id = uuid.uuid4().hex
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "pending", "mp4": None, "error": None, "ts": time.time()}
+    threading.Thread(target=_run_video_job, args=(job_id, req), daemon=True).start()
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/api/video-status/{job_id}")
+def video_status(job_id: str):
+    """Hoi trang thai job: pending | processing | done | error."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job không tồn tại hoặc đã hết hạn")
+        return {"status": job["status"], "error": job["error"]}
+
+
+@app.get("/api/video-result/{job_id}")
+def video_result(job_id: str):
+    """Tai MP4 khi job xong. Lay xong thi xoa khoi RAM."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job không tồn tại hoặc đã hết hạn")
+    if job["status"] == "error":
+        raise HTTPException(status_code=500, detail=job["error"] or "Lỗi tạo video")
+    if job["status"] != "done" or not job["mp4"]:
+        raise HTTPException(status_code=409, detail="Video chưa sẵn sàng")
+    mp4 = job["mp4"]
+    with _jobs_lock:
+        _jobs.pop(job_id, None)
     return StreamingResponse(
         io.BytesIO(mp4), media_type="video/mp4",
         headers={"Content-Disposition": 'attachment; filename="tiktok_video.mp4"'}
