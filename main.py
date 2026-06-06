@@ -724,7 +724,57 @@ def _kb_frame(base: Image.Image, p: float, preset) -> Image.Image:
     return base.crop((int(x), int(y), int(x + vis_w), int(y + vis_h))).resize((AW, AH), Image.BILINEAR)
 
 AV_R = 40                       # ban kinh avatar
-AV_COLORS = [(244, 63, 94), (56, 189, 248)]   # A = hong, B = xanh
+AV_COLORS = [(244, 63, 94), (56, 189, 248)]   # A = hong, B = xanh (fallback vong tron)
+
+# Chan dung AI cho moi persona (mo ta tieng Anh cho gpt-image-1 ra anh dep hon).
+PERSONA_PORTRAIT = {
+    "rapper": "a young Vietnamese male street rapper wearing a cap and hoodie, confident cool look",
+    "ballad": "a gentle young Vietnamese female ballad singer with a soft warm smile",
+    "mc": "an energetic young Vietnamese male TV host in a smart outfit, bright friendly smile",
+    "chidai": "a confident mature Vietnamese woman, warm strong expression, Southern Vietnam vibe",
+    "cool": "a cool stylish young Vietnamese man with a calm confident expression",
+    "genz": "a trendy cheerful young Vietnamese Gen Z girl, cute and fashionable",
+}
+_portrait_cache: dict = {}
+_portrait_lock = threading.Lock()
+
+def _gen_persona_portrait(persona: dict):
+    """Sinh 1 anh chan dung cho persona bang gpt-image-1. Tra ve PIL hoac None."""
+    desc = PERSONA_PORTRAIT.get(persona["id"], f"a friendly Vietnamese person ({persona['name']})")
+    try:
+        r = openai_client.images.generate(
+            model="gpt-image-1",
+            prompt=(f"Portrait headshot avatar of {desc}. Head and shoulders, facing camera, "
+                    f"friendly, clean solid-color studio background, soft even lighting, vibrant "
+                    f"modern social-media style, highly detailed. No text, no watermark."),
+            size="1024x1024", quality="low", n=1,
+        )
+        return Image.open(io.BytesIO(base64.b64decode(r.data[0].b64_json))).convert("RGB")
+    except Exception:
+        return None
+
+def _get_persona_portrait(persona: dict):
+    """Lay chan dung persona, cache theo id de tranh sinh lai (tiet kiem chi phi)."""
+    pid = persona["id"]
+    with _portrait_lock:
+        if pid in _portrait_cache:
+            return _portrait_cache[pid]
+    img = _gen_persona_portrait(persona)
+    if img is not None:
+        with _portrait_lock:
+            _portrait_cache[pid] = img
+    return img
+
+def _circle_portrait(img: Image.Image, d: int, dim: bool = False) -> Image.Image:
+    """Cat anh thanh hinh tron duong kinh d (RGBA). dim=True -> lam toi (nhan vat khong noi)."""
+    p = img.convert("RGB").resize((d, d), Image.LANCZOS)
+    if dim:
+        p = Image.eval(p, lambda x: int(x * 0.4))
+    p = p.convert("RGBA")
+    mask = Image.new("L", (d, d), 0)
+    ImageDraw.Draw(mask).ellipse([0, 0, d - 1, d - 1], fill=255)
+    p.putalpha(mask)
+    return p
 
 def _build_anim_make_frame(scenes, captions, duration, product_name,
                            avatars=None, caption_speakers=None):
@@ -749,17 +799,35 @@ def _build_anim_make_frame(scenes, captions, duration, product_name,
     av_cy = AH - scrim_h + 84
     av_pos = [int(AW * 0.24), int(AW * 0.76)]   # A trai, B phai
 
-    def _draw_avatars(draw, active_name):
-        for av, cx in zip(avatars, av_pos):
+    # Chuan bi san anh tron (sang + mo) cho moi avatar -> khong resize lai moi frame
+    av_imgs = []
+    for av in (avatars or []):
+        port = av.get("portrait")
+        if port is not None:
+            av_imgs.append((_circle_portrait(port, 2 * AV_R, False),
+                            _circle_portrait(port, 2 * AV_R, True)))
+        else:
+            av_imgs.append((None, None))
+
+    def _draw_avatars(draw, base, active_name):
+        for av, cx, (img_act, img_dim) in zip(avatars, av_pos, av_imgs):
             active = active_name is not None and av["name"] == active_name
-            col = av["color"] if active else tuple(int(c * 0.4) for c in av["color"])
+            img = img_act if active else img_dim
+            if img is not None:                 # co chan dung AI -> dan anh tron
+                base.alpha_composite(img, (cx - AV_R, av_cy - AV_R))
+            else:                               # fallback: vong tron + chu cai dau
+                col = av["color"] if active else tuple(int(c * 0.4) for c in av["color"])
+                draw.ellipse([cx - AV_R, av_cy - AV_R, cx + AV_R, av_cy + AV_R], fill=col + (255,))
+                tc = (255, 255, 255, 255) if active else (170, 170, 170, 255)
+                try:
+                    draw.text((cx, av_cy), av["initial"], font=font_av, fill=tc, anchor="mm")
+                except TypeError:
+                    pass
             if active:   # vien sang cho nguoi dang noi
                 draw.ellipse([cx - AV_R - 5, av_cy - AV_R - 5, cx + AV_R + 5, av_cy + AV_R + 5],
                              outline=(255, 255, 255, 255), width=4)
-            draw.ellipse([cx - AV_R, av_cy - AV_R, cx + AV_R, av_cy + AV_R], fill=col + (255,))
             tcol = (255, 255, 255, 255) if active else (170, 170, 170, 255)
             try:
-                draw.text((cx, av_cy), av["initial"], font=font_av, fill=tcol, anchor="mm")
                 draw.text((cx, av_cy + AV_R + 16), av["name"][:16], font=font_avn, fill=tcol, anchor="mm")
             except TypeError:
                 pass
@@ -786,7 +854,7 @@ def _build_anim_make_frame(scenes, captions, duration, product_name,
         # Avatar 2 nhan vat (sang nguoi dang noi)
         if avatars:
             spk = caption_speakers[ci] if caption_speakers and ci < len(caption_speakers) else None
-            _draw_avatars(draw, spk)
+            _draw_avatars(draw, base, spk)
         elif product_name:
             label = product_name[:40] + "…" if len(product_name) > 40 else product_name
             try:
@@ -958,10 +1026,6 @@ def _build_video_sync(req: VideoRequest) -> bytes:
     caps = _parse_dialogue_captions(dialogue)
     captions = [t for _, t in caps]
     caption_speakers = [n for n, _ in caps]
-    avatars = [
-        {"name": persona_a["name"], "initial": _avatar_initial(persona_a["name"]), "color": AV_COLORS[0]},
-        {"name": persona_b["name"], "initial": _avatar_initial(persona_b["name"]), "color": AV_COLORS[1]},
-    ]
     # So canh AI = ceil(captions/4), gioi han 2..3 de kiem soat chi phi
     n_scene = max(2, min(3, -(-len(captions) // 4)))
 
@@ -976,15 +1040,27 @@ def _build_video_sync(req: VideoRequest) -> bytes:
         except Exception:
             pass
 
-    # Chay song song: tong hop audio hoi thoai (da giong) + sinh anh canh bang AI.
+    # Chay song song: audio hoi thoai (da giong) + anh canh AI + chan dung 2 nhan vat.
     # Scene prompts dung kich ban GOC (con marker [BOI CANH QUAY]...) de co goi y hinh anh.
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    # Chan dung duoc cache theo persona id nen tu lan 2 tro di gan nhu tuc thi.
+    with ThreadPoolExecutor(max_workers=4) as ex:
         f_audio = ex.submit(_synth_video_audio, dialogue, persona_a["voice"])
         f_scenes = ex.submit(
             lambda: _gen_scene_images(_gen_scene_prompts(req.script, req.product_name, n_scene))
         )
+        f_pa = ex.submit(_get_persona_portrait, persona_a)
+        f_pb = ex.submit(_get_persona_portrait, persona_b)
         audio_bytes = f_audio.result()
         scenes = f_scenes.result()
+        portrait_a = f_pa.result()
+        portrait_b = f_pb.result()
+
+    avatars = [
+        {"name": persona_a["name"], "initial": _avatar_initial(persona_a["name"]),
+         "color": AV_COLORS[0], "portrait": portrait_a},
+        {"name": persona_b["name"], "initial": _avatar_initial(persona_b["name"]),
+         "color": AV_COLORS[1], "portrait": portrait_b},
+    ]
 
     # Thay canh sinh loi bang gradient du phong -> luon du canh
     scenes = [s if s is not None else _fallback_scene(i) for i, s in enumerate(scenes)]
