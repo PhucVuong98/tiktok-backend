@@ -638,7 +638,7 @@ def _render_slide(bg_arr: np.ndarray, caption: str, product_name: str) -> np.nda
 # =========================================================================
 # ANIMATION: anh AI (gpt-image-1) + chuyen dong dien anh (Ken Burns)
 # =========================================================================
-AW, AH = 540, 960          # do phan giai video animation (9:16, nhe cho free tier)
+AW, AH = 480, 854          # do phan giai video animation (9:16, nhe cho free tier — ha xuong de render duoi 100s)
 KB_Z = 1.25                # bien du de zoom/pan trong anh
 KB_PRESETS = [             # (fx0, fy0, fx1, fy1, zoom_in)
     (0.0, 0.0, 1.0, 1.0, True),
@@ -842,8 +842,9 @@ async def generate_video(req: VideoRequest):
         raise HTTPException(status_code=400, detail="Script trống")
 
     captions = _parse_captions(req.script)
-    # So canh AI = ceil(captions/4), gioi han 2..4 de kiem soat chi phi + thoi gian
-    n_scene = max(2, min(4, -(-len(captions) // 4)))
+    # So canh AI = ceil(captions/4), gioi han 2..3 de kiem soat chi phi + thoi gian
+    # (moi anh gpt-image-1 ton ~15-25s, giam toi da 3 de tong thoi gian < 100s edge timeout)
+    n_scene = max(2, min(3, -(-len(captions) // 4)))
 
     # Tai anh san pham that (neu co) -> dung lam canh cuoi (product reveal)
     img_bytes = None
@@ -900,7 +901,7 @@ async def generate_video(req: VideoRequest):
             video = VideoClip(make_frame, duration=duration)
             video = video.set_audio(audio_clip)
             video.write_videofile(
-                video_path, fps=20, codec="libx264", audio_codec="aac",
+                video_path, fps=14, codec="libx264", audio_codec="aac",
                 preset="ultrafast", threads=2,
                 temp_audiofile=os.path.join(tmp, "tmp_audio.m4a"),
                 remove_temp=True, logger=None
