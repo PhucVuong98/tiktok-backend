@@ -725,9 +725,6 @@ def _kb_frame(base: Image.Image, p: float, preset) -> Image.Image:
     x = mx * _lerp(fx0, fx1, p); y = my * _lerp(fy0, fy1, p)
     return base.crop((int(x), int(y), int(x + vis_w), int(y + vis_h))).resize((AW, AH), Image.BILINEAR)
 
-AV_R = 40                       # ban kinh avatar
-AV_COLORS = [(244, 63, 94), (56, 189, 248)]   # A = hong, B = xanh (fallback vong tron)
-
 # Chan dung AI cho moi persona (mo ta tieng Anh cho gpt-image-1 ra anh dep hon).
 PERSONA_PORTRAIT = {
     "rapper": "a young Vietnamese male street rapper wearing a cap and hoodie, confident cool look",
@@ -741,99 +738,124 @@ _portrait_cache: dict = {}
 _portrait_lock = threading.Lock()
 
 def _gen_persona_portrait(persona: dict):
-    """Sinh 1 anh chan dung cho persona bang gpt-image-1. Tra ve PIL hoac None."""
+    """Sinh 1 anh chan dung 1024x1024 (mieng ngam) cho persona. Tra ve PIL hoac None."""
     desc = PERSONA_PORTRAIT.get(persona["id"], f"a friendly Vietnamese person ({persona['name']})")
     try:
         r = openai_client.images.generate(
             model="gpt-image-1",
-            prompt=(f"Portrait headshot avatar of {desc}. Head and shoulders, facing camera, "
-                    f"friendly, clean solid-color studio background, soft even lighting, vibrant "
-                    f"modern social-media style, highly detailed. No text, no watermark."),
+            prompt=(f"Front-facing portrait headshot of {desc}. Head and shoulders, centered, "
+                    f"looking straight at camera, mouth closed, neutral friendly expression, "
+                    f"clean solid-color studio background, soft even lighting, vibrant modern "
+                    f"social-media style, highly detailed. No text, no watermark."),
             size="1024x1024", quality="low", n=1,
         )
-        img = Image.open(io.BytesIO(base64.b64decode(r.data[0].b64_json))).convert("RGB")
-        return img.resize((256, 256), Image.LANCZOS)   # avatar nho -> tiet kiem RAM
+        return Image.open(io.BytesIO(base64.b64decode(r.data[0].b64_json))).convert("RGB")
     except Exception:
         return None
 
-def _get_persona_portrait(persona: dict):
-    """Lay chan dung persona, cache theo id de tranh sinh lai (tiet kiem chi phi)."""
+def _gen_open_mouth(base1024: Image.Image):
+    """Tu anh chan dung (mieng ngam) tao ban HA MIENG bang images.edit + mask vung mieng.
+    Giu nguyen guong mat (chi sua vung mieng). Tra ve PIL 1024 hoac None."""
+    try:
+        d = 1024
+        img = base1024.convert("RGB").resize((d, d), Image.LANCZOS)
+        # mask RGBA: vung TRONG SUOT (alpha=0) la vung se duoc chinh -> dat o mieng
+        mask = Image.new("RGBA", (d, d), (0, 0, 0, 255))
+        cx, cy = d // 2, int(d * 0.66)
+        rw, rh = int(d * 0.16), int(d * 0.11)
+        ImageDraw.Draw(mask).ellipse([cx - rw, cy - rh, cx + rw, cy + rh], fill=(0, 0, 0, 0))
+        bi = io.BytesIO(); img.save(bi, "PNG"); bi.seek(0); bi.name = "image.png"
+        bm = io.BytesIO(); mask.save(bm, "PNG"); bm.seek(0); bm.name = "mask.png"
+        r = openai_client.images.edit(
+            model="gpt-image-1", image=bi, mask=bm, size="1024x1024", n=1,
+            prompt=("Same person, same face and lighting, but with the mouth OPEN as if "
+                    "talking mid-sentence, natural open mouth slightly showing teeth."),
+        )
+        return Image.open(io.BytesIO(base64.b64decode(r.data[0].b64_json))).convert("RGB")
+    except Exception:
+        return None
+
+def _get_persona_faces(persona: dict):
+    """Tra ve (anh_ngam_512, anh_ha_512_or_None), cache theo id de khong sinh lai."""
     pid = persona["id"]
     with _portrait_lock:
         if pid in _portrait_cache:
             return _portrait_cache[pid]
-    img = _gen_persona_portrait(persona)
-    if img is not None:
-        with _portrait_lock:
-            _portrait_cache[pid] = img
-    return img
+    base = _gen_persona_portrait(persona)
+    if base is None:
+        return (None, None)
+    opened = _gen_open_mouth(base)
+    faces = (base.resize((512, 512), Image.LANCZOS),
+             opened.resize((512, 512), Image.LANCZOS) if opened is not None else None)
+    with _portrait_lock:
+        _portrait_cache[pid] = faces
+    return faces
 
-def _circle_portrait(img: Image.Image, d: int, dim: bool = False) -> Image.Image:
-    """Cat anh thanh hinh tron duong kinh d (RGBA). dim=True -> lam toi (nhan vat khong noi)."""
-    p = img.convert("RGB").resize((d, d), Image.LANCZOS)
-    if dim:
-        p = Image.eval(p, lambda x: int(x * 0.4))
-    p = p.convert("RGBA")
+def _circle_portrait(img: Image.Image, d: int) -> Image.Image:
+    """Cat anh thanh hinh tron duong kinh d (RGBA, vien mem)."""
+    p = img.convert("RGB").resize((d, d), Image.LANCZOS).convert("RGBA")
     mask = Image.new("L", (d, d), 0)
     ImageDraw.Draw(mask).ellipse([0, 0, d - 1, d - 1], fill=255)
     p.putalpha(mask)
     return p
 
+CH_R = 150                      # ban kinh chan dung nhan vat lon
+
 def _build_anim_make_frame(scenes, captions, duration, product_name,
-                           avatars=None, caption_speakers=None):
-    """Tra ve make_frame: Ken Burns + crossfade + caption + avatar 2 nhan vat.
-    avatars: list dict {name, initial, color}. caption_speakers: ten nguoi noi moi caption
-    (de lam sang avatar dang noi)."""
+                           characters=None, caption_speakers=None):
+    """Tra ve make_frame: Ken Burns + nhan vat lon dang noi (map may mieng + nhun) + caption.
+    characters: list dict {name, closed, open} (PIL 512 hoac None).
+    caption_speakers: ten nguoi noi moi caption."""
     bases = [_cover_base(s) for s in scenes]
     n_s = len(bases); n_c = max(1, len(captions))
     sdur = duration / n_s; cdur = duration / n_c
     td = min(0.5, sdur * 0.4)
 
-    scrim_h = 380
+    scrim_h = 360
     ys = (np.arange(scrim_h) / scrim_h) ** 1.4
     scrim_arr = np.zeros((scrim_h, AW, 4), np.uint8)
     scrim_arr[..., 3] = (210 * ys).astype(np.uint8)[:, None]
     scrim = Image.fromarray(scrim_arr, "RGBA")
     font_cap = _get_font(40)
     font_pn = _get_font(22)
-    font_av = _get_font(36)     # chu cai dau trong avatar
-    font_avn = _get_font(20)    # ten duoi avatar
+    font_nm = _get_font(24)     # ten nhan vat
 
-    av_cy = AH - scrim_h + 84
-    av_pos = [int(AW * 0.24), int(AW * 0.76)]   # A trai, B phai
+    char_cx = AW // 2
+    char_cy = 430
+    D = 2 * CH_R
 
-    # Chuan bi san anh tron (sang + mo) cho moi avatar -> khong resize lai moi frame
-    av_imgs = []
-    for av in (avatars or []):
-        port = av.get("portrait")
-        if port is not None:
-            av_imgs.append((_circle_portrait(port, 2 * AV_R, False),
-                            _circle_portrait(port, 2 * AV_R, True)))
-        else:
-            av_imgs.append((None, None))
+    # Chuan bi san anh tron ngam/ha mieng cho moi nhan vat (khong resize lai moi frame)
+    ch_circ = {}
+    for ch in (characters or []):
+        cl = _circle_portrait(ch["closed"], D) if ch.get("closed") is not None else None
+        op = _circle_portrait(ch["open"], D) if ch.get("open") is not None else None
+        ch_circ[ch["name"]] = (cl, op)
 
-    def _draw_avatars(draw, base, active_name):
-        for av, cx, (img_act, img_dim) in zip(avatars, av_pos, av_imgs):
-            active = active_name is not None and av["name"] == active_name
-            img = img_act if active else img_dim
-            if img is not None:                 # co chan dung AI -> dan anh tron
-                base.alpha_composite(img, (cx - AV_R, av_cy - AV_R))
-            else:                               # fallback: vong tron + chu cai dau
-                col = av["color"] if active else tuple(int(c * 0.4) for c in av["color"])
-                draw.ellipse([cx - AV_R, av_cy - AV_R, cx + AV_R, av_cy + AV_R], fill=col + (255,))
-                tc = (255, 255, 255, 255) if active else (170, 170, 170, 255)
-                try:
-                    draw.text((cx, av_cy), av["initial"], font=font_av, fill=tc, anchor="mm")
-                except TypeError:
-                    pass
-            if active:   # vien sang cho nguoi dang noi
-                draw.ellipse([cx - AV_R - 5, av_cy - AV_R - 5, cx + AV_R + 5, av_cy + AV_R + 5],
-                             outline=(255, 255, 255, 255), width=4)
-            tcol = (255, 255, 255, 255) if active else (170, 170, 170, 255)
-            try:
-                draw.text((cx, av_cy + AV_R + 16), av["name"][:16], font=font_avn, fill=tcol, anchor="mm")
-            except TypeError:
-                pass
+    def _draw_character(base, draw, name, cstart, t):
+        pair = ch_circ.get(name)
+        if not pair or pair[0] is None:
+            return False
+        closed, opened = pair
+        # map may mieng: doi ngam/ha moi ~0.1s khi dang noi
+        use_open = opened is not None and (int(t / 0.1) % 2 == 1)
+        img = opened if use_open else closed
+        # "nay" nhe khi vao luot moi (scale 0.9 -> 1.0) + nhun len xuong nhe
+        pop = min(1.0, (t - cstart) / 0.22)
+        scale = 0.9 + 0.1 * (pop * pop * (3 - 2 * pop))
+        bob = int(np.sin(t * 9.0) * 4)
+        d = max(8, int(D * scale))
+        im = img.resize((d, d), Image.BILINEAR)
+        x = char_cx - d // 2; y = char_cy - d // 2 + bob
+        # vong sang phia sau cho noi bat
+        draw.ellipse([char_cx - d // 2 - 5, y - 5, char_cx + d // 2 + 5, y + d + 5],
+                     outline=(255, 255, 255, 230), width=4)
+        base.alpha_composite(im, (x, y))
+        try:
+            draw.text((char_cx, char_cy + CH_R + 26), name[:18], font=font_nm,
+                      fill=(255, 255, 255, 255), anchor="mm")
+        except TypeError:
+            pass
+        return True
 
     def scene_at(t):
         si = min(int(t / sdur), n_s - 1)
@@ -854,22 +876,24 @@ def _build_anim_make_frame(scenes, captions, duration, product_name,
         cp = (t - ci * cdur) / cdur
         alpha = min(1.0, cp / 0.2)
 
-        # Avatar 2 nhan vat (sang nguoi dang noi)
-        if avatars:
+        # Nhan vat lon dang noi
+        drew = False
+        if characters:
             spk = caption_speakers[ci] if caption_speakers and ci < len(caption_speakers) else None
-            _draw_avatars(draw, base, spk)
-        elif product_name:
+            if spk is not None:
+                drew = _draw_character(base, draw, spk, ci * cdur, t)
+        if not drew and product_name:
             label = product_name[:40] + "…" if len(product_name) > 40 else product_name
             try:
-                draw.text((AW // 2, AH - scrim_h + 34), label, font=font_pn,
+                draw.text((AW // 2, AH - scrim_h + 30), label, font=font_pn,
                           fill=(220, 220, 220, 230), anchor="mm")
             except TypeError:
                 pass
 
-        # Caption (toi da 3 dong de khong de len avatar)
+        # Caption (toi da 3 dong)
         wrapped = textwrap.wrap(captions[ci], width=18)[:3]
         line_h = 50
-        y = AH - 60 - len(wrapped) * line_h
+        y = AH - 55 - len(wrapped) * line_h
         tc = (255, 255, 255, int(255 * alpha)); sc = (0, 0, 0, int(180 * alpha))
         for ln in wrapped:
             try:
@@ -929,13 +953,6 @@ Yêu cầu:
     )
     return raw.strip()
 
-
-def _avatar_initial(name: str) -> str:
-    """Lay chu cai dau (in hoa) cua ten nhan vat de hien trong avatar."""
-    for ch in name:
-        if ch.isalnum():
-            return ch.upper()
-    return "?"
 
 def _parse_dialogue_captions(dialogue: str) -> list:
     """Moi luot thoai -> 1 hoac nhieu (ten_nguoi_noi, caption). Chia nho luot dai."""
@@ -1051,18 +1068,16 @@ def _build_video_sync(req: VideoRequest) -> bytes:
         f_scenes = ex.submit(
             lambda: _gen_scene_images(_gen_scene_prompts(req.script, req.product_name, n_scene))
         )
-        f_pa = ex.submit(_get_persona_portrait, persona_a)
-        f_pb = ex.submit(_get_persona_portrait, persona_b)
+        f_fa = ex.submit(_get_persona_faces, persona_a)
+        f_fb = ex.submit(_get_persona_faces, persona_b)
         audio_bytes = f_audio.result()
         scenes = f_scenes.result()
-        portrait_a = f_pa.result()
-        portrait_b = f_pb.result()
+        faces_a = f_fa.result()
+        faces_b = f_fb.result()
 
-    avatars = [
-        {"name": persona_a["name"], "initial": _avatar_initial(persona_a["name"]),
-         "color": AV_COLORS[0], "portrait": portrait_a},
-        {"name": persona_b["name"], "initial": _avatar_initial(persona_b["name"]),
-         "color": AV_COLORS[1], "portrait": portrait_b},
+    characters = [
+        {"name": persona_a["name"], "closed": faces_a[0], "open": faces_a[1]},
+        {"name": persona_b["name"], "closed": faces_b[0], "open": faces_b[1]},
     ]
 
     # Thay canh sinh loi bang gradient du phong -> luon du canh
@@ -1091,7 +1106,7 @@ def _build_video_sync(req: VideoRequest) -> bytes:
         # make_frame chi giu 1 khung trong RAM -> nhe cho free tier.
         make_frame = _build_anim_make_frame(
             scenes, captions, duration, req.product_name,
-            avatars=avatars, caption_speakers=caption_speakers,
+            characters=characters, caption_speakers=caption_speakers,
         )
 
         video = VideoClip(make_frame, duration=duration)
