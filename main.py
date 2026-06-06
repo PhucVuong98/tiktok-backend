@@ -666,9 +666,15 @@ def _fallback_scene(i: int) -> Image.Image:
         base[..., k] = (c1[k] + (c2[k] - c1[k]) * f).astype(np.uint8)
     return Image.fromarray(base)
 
-def _gen_scene_prompts(script: str, product_name: str, n: int) -> list:
-    """Dung gpt-4o-mini sinh n prompt anh (tieng Anh) tu noi dung script."""
+def _gen_scene_prompts(script: str, product_name: str, n: int, product_focus: bool = False) -> list:
+    """Dung gpt-4o-mini sinh n prompt anh (tieng Anh) tu noi dung script.
+    product_focus=True (mode review 1 nhan vat): moi canh DAT SAN PHAM lam trung tam."""
     excerpt = re.sub(r'\[.*?\]\s*:?', '', script).strip()[:600]
+    focus = (
+        (f"This is a PRODUCT REVIEW. The product \"{product_name or 'the product'}\" MUST be the "
+         f"clear hero/centerpiece of EVERY scene (close-ups, product in use, lifestyle with the "
+         f"product). ") if product_focus else ""
+    )
     prompts = []
     try:
         r = openai_client.chat.completions.create(
@@ -676,6 +682,7 @@ def _gen_scene_prompts(script: str, product_name: str, n: int) -> list:
             messages=[{"role": "user", "content": (
                 f"You write vivid cinematic IMAGE prompts (English) for a vertical 9:16 short "
                 f"video advertising this product: \"{product_name or 'a product'}\".\n"
+                f"{focus}"
                 f"Script context:\n{excerpt}\n\n"
                 f"Output EXACTLY {n} prompts, one per line, no numbering. Each is one rich visual "
                 f"scene (setting, subject, lighting, mood, color) relevant to the product/story, "
@@ -910,11 +917,12 @@ def _build_anim_make_frame(scenes, captions, duration, product_name,
 
 class VideoRequest(BaseModel):
     script: str
-    voice: str = "nova"            # giữ để tương thích cũ; video giờ luôn hội thoại đa giọng
+    voice: str = "nova"            # giữ để tương thích cũ
     product_image_url: str = ""
     product_name: str = ""
-    persona_a_id: str = "genz"     # nhân vật A (xem VOICE_PERSONAS)
-    persona_b_id: str = "cool"     # nhân vật B
+    mode: str = "dialogue"         # "dialogue" = 2 nhân vật hội thoại; "single" = 1 nhân vật review
+    persona_a_id: str = "genz"     # nhân vật A / hoặc người review (mode single)
+    persona_b_id: str = "cool"     # nhân vật B (chỉ mode dialogue)
 
 
 def _scriptify_to_dialogue(script: str, product_name: str,
@@ -1028,26 +1036,30 @@ def _synth_video_audio(script: str, default_voice: str) -> bytes:
     return resp.content
 
 
+def _synth_single_voice(script: str, voice: str) -> bytes:
+    """Doc THANG script bang 1 giong (mode review 1 nhan vat).
+    Xoa stage direction [BOI CANH QUAY]/[HOOK]... roi doc lien mach -> khong hieu nham
+    cac marker la nhan vat nhu _synth_video_audio."""
+    clean = re.sub(r'\[.*?\]\s*:?', '', script)
+    clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Script rỗng sau khi làm sạch")
+    resp = openai_client.audio.speech.create(
+        model="tts-1", voice=voice, input=clean, response_format="mp3"
+    )
+    return resp.content
+
+
 def _build_video_sync(req: VideoRequest) -> bytes:
     """Toan bo pipeline tao video, chay DONG BO trong 1 thread nen (worker job).
     Tra ve bytes MP4. Nem Exception (kem message) neu loi -> job luu vao status error.
 
-    Video luon o dang HOI THOAI: chuyen kich ban -> doan thoai 2 nhan vat, doc da giong.
+    2 mode:
+    - "single": 1 nhan vat tu review -> 1 giong doc thang script, KHONG hoat hinh nhan vat,
+      background bam sat san pham.
+    - "dialogue" (mac dinh): chuyen kich ban -> hoi thoai 2 nhan vat, doc da giong + nhan vat noi.
     """
-    persona_a = PERSONA_MAP.get(req.persona_a_id, VOICE_PERSONAS[0])
-    persona_b = PERSONA_MAP.get(req.persona_b_id, VOICE_PERSONAS[1])
-    # Neu chon trung 1 nhan vat -> ep B khac A de van co 2 giong
-    if persona_b["id"] == persona_a["id"]:
-        persona_b = next((p for p in VOICE_PERSONAS if p["id"] != persona_a["id"]), persona_b)
-
-    # Buoc 1: chuyen kich ban doc 1 giong -> hoi thoai 2 nhan vat
-    dialogue = _scriptify_to_dialogue(req.script, req.product_name, persona_a, persona_b)
-
-    caps = _parse_dialogue_captions(dialogue)
-    captions = [t for _, t in caps]
-    caption_speakers = [n for n, _ in caps]
-    # So canh AI = ceil(captions/4), gioi han 2..3 de kiem soat chi phi
-    n_scene = max(2, min(3, -(-len(captions) // 4)))
+    single = (req.mode == "single")
 
     # Tai anh san pham that (neu co) -> dung lam canh cuoi (product reveal)
     img_bytes = None
@@ -1060,25 +1072,51 @@ def _build_video_sync(req: VideoRequest) -> bytes:
         except Exception:
             pass
 
-    # Chay song song: audio hoi thoai (da giong) + anh canh AI + chan dung 2 nhan vat.
-    # Scene prompts dung kich ban GOC (con marker [BOI CANH QUAY]...) de co goi y hinh anh.
-    # Chan dung duoc cache theo persona id nen tu lan 2 tro di gan nhu tuc thi.
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        f_audio = ex.submit(_synth_video_audio, dialogue, persona_a["voice"])
-        f_scenes = ex.submit(
-            lambda: _gen_scene_images(_gen_scene_prompts(req.script, req.product_name, n_scene))
-        )
-        f_fa = ex.submit(_get_persona_faces, persona_a)
-        f_fb = ex.submit(_get_persona_faces, persona_b)
-        audio_bytes = f_audio.result()
-        scenes = f_scenes.result()
-        faces_a = f_fa.result()
-        faces_b = f_fb.result()
+    if single:
+        # ===== MODE 1 NHAN VAT REVIEW =====
+        persona = PERSONA_MAP.get(req.persona_a_id, VOICE_PERSONAS[0])
+        captions = _parse_captions(req.script)
+        caption_speakers = None
+        characters = None
+        n_scene = max(2, min(3, -(-len(captions) // 4)))
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_audio = ex.submit(_synth_single_voice, req.script, persona["voice"])
+            f_scenes = ex.submit(
+                lambda: _gen_scene_images(
+                    _gen_scene_prompts(req.script, req.product_name, n_scene, product_focus=True))
+            )
+            audio_bytes = f_audio.result()
+            scenes = f_scenes.result()
+    else:
+        # ===== MODE HOI THOAI 2 NHAN VAT (mac dinh) =====
+        persona_a = PERSONA_MAP.get(req.persona_a_id, VOICE_PERSONAS[0])
+        persona_b = PERSONA_MAP.get(req.persona_b_id, VOICE_PERSONAS[1])
+        if persona_b["id"] == persona_a["id"]:   # trung -> ep B khac de van co 2 giong
+            persona_b = next((p for p in VOICE_PERSONAS if p["id"] != persona_a["id"]), persona_b)
 
-    characters = [
-        {"name": persona_a["name"], "closed": faces_a[0], "open": faces_a[1]},
-        {"name": persona_b["name"], "closed": faces_b[0], "open": faces_b[1]},
-    ]
+        dialogue = _scriptify_to_dialogue(req.script, req.product_name, persona_a, persona_b)
+        caps = _parse_dialogue_captions(dialogue)
+        captions = [t for _, t in caps]
+        caption_speakers = [n for n, _ in caps]
+        n_scene = max(2, min(3, -(-len(captions) // 4)))
+
+        # audio hoi thoai (da giong) + anh canh AI + chan dung 2 nhan vat (cache theo id).
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            f_audio = ex.submit(_synth_video_audio, dialogue, persona_a["voice"])
+            f_scenes = ex.submit(
+                lambda: _gen_scene_images(_gen_scene_prompts(req.script, req.product_name, n_scene))
+            )
+            f_fa = ex.submit(_get_persona_faces, persona_a)
+            f_fb = ex.submit(_get_persona_faces, persona_b)
+            audio_bytes = f_audio.result()
+            scenes = f_scenes.result()
+            faces_a = f_fa.result()
+            faces_b = f_fb.result()
+
+        characters = [
+            {"name": persona_a["name"], "closed": faces_a[0], "open": faces_a[1]},
+            {"name": persona_b["name"], "closed": faces_b[0], "open": faces_b[1]},
+        ]
 
     # Thay canh sinh loi bang gradient du phong -> luon du canh
     scenes = [s if s is not None else _fallback_scene(i) for i, s in enumerate(scenes)]
