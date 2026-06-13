@@ -11,6 +11,7 @@ import json
 import time
 import uuid
 import base64
+import math
 import random
 import textwrap
 import tempfile
@@ -826,6 +827,134 @@ def _circle_portrait(img: Image.Image, d: int) -> Image.Image:
     p.putalpha(mask)
     return p
 
+# =========================================================================
+# ANIMATION NANG CAP (thuan PIL/numpy -> $0, KHONG goi them API):
+#  1) Chuyen canh da dang: crossfade / slide-push / zoom-punch / whip-pan
+#  2) Caption karaoke: hien tung chu theo loi noi (chu dang toi = vang + nhich len)
+#  3) Sticker sparkle: ngoi sao lap lanh bay len khi caption co tu "hype"
+# =========================================================================
+SCENE_TRANSITIONS = ["crossfade", "slide", "zoom", "whip"]
+
+def _zoom_center(img: Image.Image, z: float) -> Image.Image:
+    """Phong to anh quanh tam roi crop ve dung kich thuoc cu (cho zoom-punch)."""
+    if z <= 1.0:
+        return img
+    w, h = img.size
+    big = img.resize((int(w * z), int(h * z)), Image.BILINEAR)
+    bw, bh = big.size
+    left = (bw - w) // 2; top = (bh - h) // 2
+    return big.crop((left, top, left + w, top + h))
+
+def _transition(f_cur: Image.Image, f_next: Image.Image, a: float, kind: str) -> Image.Image:
+    """Tron 2 khung canh (AW x AH) theo tien do a (0->1) voi kieu chuyen canh `kind`."""
+    a = max(0.0, min(1.0, a))
+    if kind == "slide":          # day ngang: canh cu truot trai, canh moi vao tu phai
+        dx = int(a * AW)
+        out = Image.new("RGB", (AW, AH))
+        out.paste(f_cur, (-dx, 0)); out.paste(f_next, (AW - dx, 0))
+        return out
+    if kind == "zoom":           # canh moi "dam" vao: zoom 1.18 -> 1.0 + blend
+        nf = _zoom_center(f_next, _lerp(1.18, 1.0, a))
+        return Image.blend(f_cur, nf, a)
+    if kind == "whip":           # quat ngang mo: 2 khung mo dan giua chang + truot
+        r = math.sin(a * math.pi) * 7.0
+        fc = f_cur.filter(ImageFilter.GaussianBlur(r)) if r > 0.3 else f_cur
+        fn = f_next.filter(ImageFilter.GaussianBlur(r)) if r > 0.3 else f_next
+        dx = int(a * AW)
+        out = Image.new("RGB", (AW, AH))
+        out.paste(fc, (-dx, 0)); out.paste(fn, (AW - dx, 0))
+        return out
+    return Image.blend(f_cur, f_next, a)   # crossfade (mac dinh)
+
+# --- Caption karaoke ----------------------------------------------------
+def _draw_karaoke(draw, text, cp, font, y0, line_h, width=18, max_lines=3):
+    """Ve caption hien dan tung chu. cp = tien do trong caption (0..1).
+    Chu da qua = trang, chu dang toi = vang + nhich len, chu chua toi = mo nhe."""
+    lines = textwrap.wrap(text, width=width)[:max_lines]
+    words = []                       # (line_idx, word) phang, gi = chi so toan cuc
+    for li, ln in enumerate(lines):
+        for w in ln.split():
+            words.append((li, w))
+    if not words:
+        return
+    total = len(words)
+    reveal = cp / 0.88 * total       # hoan tat o 88% caption -> chu cuoi kip sang
+    active = int(reveal)
+    frac = reveal - active
+    sp = draw.textlength(" ", font=font)
+    for li, ln in enumerate(lines):
+        line_words = [(gi, w) for gi, (lj, w) in enumerate(words) if lj == li]
+        widths = [draw.textlength(w, font=font) for _, w in line_words]
+        total_w = sum(widths) + sp * max(0, len(line_words) - 1)
+        x = (AW - total_w) / 2
+        y = y0 + li * line_h
+        for (gi, w), wdt in zip(line_words, widths):
+            if gi < active:
+                col = (255, 255, 255, 255); dy = 0
+            elif gi == active:
+                pop = frac * frac * (3 - 2 * frac)            # ease-in-out
+                col = (255, 222, 64, 255); dy = -int(7 * (1 - pop))
+            else:
+                col = (255, 255, 255, 70); dy = 0
+            cx = x + wdt / 2
+            try:
+                draw.text((cx + 2, y + 2 + dy), w, font=font, fill=(0, 0, 0, 150), anchor="mm")
+                draw.text((cx, y + dy), w, font=font, fill=col, anchor="mm")
+            except TypeError:
+                draw.text((x, y + dy), w, font=font, fill=col)
+            x += wdt + sp
+
+# --- Sticker sparkle ----------------------------------------------------
+_HYPE_SET = {
+    "xịn", "xin", "hot", "đỉnh", "dinh", "wow", "trend", "cháy", "chay", "mê", "me",
+    "yêu", "yeu", "thích", "thich", "tuyệt", "tuyet", "ngon", "chất", "chat", "hời", "hoi",
+    "sale", "giảm", "giam", "freeship", "sốc", "soc", "real", "vibe", "must", "deal",
+}
+
+def _has_hype(text: str) -> bool:
+    return bool(set(re.findall(r"\w+", text.lower())) & _HYPE_SET)
+
+def _sparkles_for(ci: int, n: int = 5):
+    """Sinh n sparkle co vi tri/pha co dinh (seed theo ci) -> deterministic giua cac frame."""
+    rng = random.Random(ci * 1000 + 7)
+    return [{
+        "x": rng.randint(int(AW * 0.12), int(AW * 0.88)),
+        "y": rng.randint(int(AH * 0.46), int(AH * 0.70)),
+        "delay": rng.uniform(0.0, 0.50),     # le pha xuat hien
+        "life": rng.uniform(0.45, 0.75),     # song bao lau (ti le voi caption)
+        "r": rng.randint(10, 20),
+        "rise": rng.randint(70, 140),        # bay len bao nhieu px
+        "warm": rng.random() < 0.5,          # vang am hay trang
+    } for _ in range(n)]
+
+def _star_points(cx, cy, r, rs, rot=0.0, n=4):
+    pts = []
+    for i in range(n * 2):
+        rad = r if i % 2 == 0 else rs
+        ang = rot + math.pi * i / n
+        pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+    return pts
+
+def _draw_sparkles(draw, sparkles, cp):
+    """Ve sparkle cho caption hien tai. cp = tien do trong caption (0..1)."""
+    for s in sparkles:
+        lp = (cp - s["delay"]) / s["life"]    # tien do song rieng cua sparkle
+        if lp < 0.0 or lp > 1.0:
+            continue
+        if lp < 0.25:           af = lp / 0.25
+        elif lp > 0.65:         af = max(0.0, (1.0 - lp) / 0.35)
+        else:                   af = 1.0
+        alpha = int(235 * af)
+        if alpha <= 4:
+            continue
+        twinkle = 0.6 + 0.4 * abs(math.sin(cp * 12 + s["x"]))   # lap lanh
+        rr = s["r"] * twinkle
+        cx = s["x"]; cy = s["y"] - s["rise"] * lp               # bay len
+        col = (255, 226, 130, alpha) if s["warm"] else (255, 255, 255, alpha)
+        draw.polygon(_star_points(cx, cy, rr, rr * 0.34, cp * 2.0 + s["x"]), fill=col)
+        draw.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=col)
+
+
 CH_R = 150                      # ban kinh chan dung nhan vat lon
 
 def _build_anim_make_frame(scenes, captions, duration, product_name,
@@ -850,6 +979,10 @@ def _build_anim_make_frame(scenes, captions, duration, product_name,
     char_cx = AW // 2
     char_cy = 430
     D = 2 * CH_R
+
+    # Sticker sparkle: caption nao co tu "hype" thi co san bo sparkle (seed co dinh)
+    cap_sparkles = [_sparkles_for(i) if _has_hype(c) else None
+                    for i, c in enumerate(captions)]
 
     # Chuan bi san anh tron ngam/ha mieng cho moi nhan vat (khong resize lai moi frame)
     ch_circ = {}
@@ -892,7 +1025,8 @@ def _build_anim_make_frame(scenes, captions, duration, product_name,
         if si < n_s - 1 and t > s_end - td:
             a = (t - (s_end - td)) / td
             nf = _kb_frame(bases[si + 1], 0.0, KB_PRESETS[(si + 1) % len(KB_PRESETS)])
-            f = Image.blend(f, nf, a)
+            # Chuyen canh luan phien: crossfade / slide / zoom-punch / whip-pan
+            f = _transition(f, nf, a, SCENE_TRANSITIONS[(si + 1) % len(SCENE_TRANSITIONS)])
         return f
 
     def make_frame(t):
@@ -901,7 +1035,6 @@ def _build_anim_make_frame(scenes, captions, duration, product_name,
         draw = ImageDraw.Draw(base)
         ci = min(int(t / cdur), n_c - 1)
         cp = (t - ci * cdur) / cdur
-        alpha = min(1.0, cp / 0.2)
 
         # Nhan vat lon dang noi
         drew = False
@@ -917,18 +1050,15 @@ def _build_anim_make_frame(scenes, captions, duration, product_name,
             except TypeError:
                 pass
 
-        # Caption (toi da 3 dong)
-        wrapped = textwrap.wrap(captions[ci], width=18)[:3]
+        # Sticker sparkle (ve duoi caption de khong de chu) khi caption co tu "hype"
+        if ci < len(cap_sparkles) and cap_sparkles[ci] is not None:
+            _draw_sparkles(draw, cap_sparkles[ci], cp)
+
+        # Caption karaoke: hien tung chu theo loi noi (toi da 3 dong)
         line_h = 50
-        y = AH - 55 - len(wrapped) * line_h
-        tc = (255, 255, 255, int(255 * alpha)); sc = (0, 0, 0, int(180 * alpha))
-        for ln in wrapped:
-            try:
-                draw.text((AW // 2 + 2, y + 2), ln, font=font_cap, fill=sc, anchor="mm")
-                draw.text((AW // 2, y), ln, font=font_cap, fill=tc, anchor="mm")
-            except TypeError:
-                draw.text((30, y), ln, font=font_cap, fill=tc)
-            y += line_h
+        n_lines = len(textwrap.wrap(captions[ci], width=18)[:3])
+        y0 = AH - 55 - n_lines * line_h
+        _draw_karaoke(draw, captions[ci], cp, font_cap, y0, line_h, width=18, max_lines=3)
 
         return np.array(base.convert("RGB"))
 
