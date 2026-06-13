@@ -136,3 +136,28 @@ def refund_credit(uid: str, amount: int = 1) -> None:
     except Exception:
         # Hoan that bai khong duoc lam sap worker; chi log ngam.
         pass
+
+
+# ----- TikTok OAuth token (luu ben vung tren Firestore, KHONG de RAM ephemeral) -----
+def set_tiktok_token(uid: str, data: dict) -> None:
+    """Luu/cap nhat token TikTok cua user (access/refresh/open_id/expires_at...)."""
+    db = _get_db()
+    db.collection("users").document(uid).set({"tiktok": data}, merge=True)
+
+
+def get_tiktok_token(uid: str) -> Optional[dict]:
+    """Doc token TikTok da luu. None neu user chua ket noi."""
+    db = _get_db()
+    snap = db.collection("users").document(uid).get()
+    if not snap.exists:
+        return None
+    return (snap.to_dict() or {}).get("tiktok")
+
+
+def clear_tiktok_token(uid: str) -> None:
+    """Xoa ket noi TikTok cua user (nut Ngat ket noi)."""
+    try:
+        db = _get_db()
+        db.collection("users").document(uid).update({"tiktok": firestore.DELETE_FIELD})
+    except Exception:
+        pass

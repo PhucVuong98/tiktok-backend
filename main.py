@@ -16,6 +16,8 @@ import random
 import textwrap
 import tempfile
 import threading
+import shutil
+import subprocess
 import queue as _queue
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -25,7 +27,9 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-from auth_credits import require_uid, get_credits, reserve_credit, refund_credit, admin_project_id
+from auth_credits import (require_uid, get_credits, reserve_credit, refund_credit,
+                          admin_project_id, set_tiktok_token, get_tiktok_token,
+                          clear_tiktok_token)
 
 load_dotenv()
 
@@ -1324,6 +1328,42 @@ def _parse_dialogue_captions(dialogue: str) -> list:
     return caps
 
 
+# =========================================================================
+# Nang tong giong (pitch-up): tts-1 khong co tham so pitch -> dich cao do bang ffmpeg.
+# asetrate doi ca pitch+tempo, atempo bu lai tempo -> CHI nang pitch, GIU nguyen do dai.
+# Tune qua env VOICE_PITCH_SEMITONES (so ban am, >0 = cao hon). 0 = tat.
+# =========================================================================
+VOICE_PITCH = float(os.getenv("VOICE_PITCH_SEMITONES", "2"))   # +2 ban am: tuoi/cao hon ro nhung tu nhien
+_TTS_SR = 24000                                                # tts-1 xuat mp3 24kHz
+
+def _ffmpeg_exe() -> str:
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg") or "ffmpeg"
+
+def _pitch_up(mp3: bytes, semitones: float | None = None) -> bytes:
+    """Nang cao do giong (giu nguyen do dai) bang ffmpeg. Loi/khong can -> tra nguyen ban."""
+    n = VOICE_PITCH if semitones is None else semitones
+    if not mp3 or abs(n) < 0.01:
+        return mp3
+    factor = 2 ** (n / 12.0)
+    af = (f"asetrate={_TTS_SR}*{factor:.6f},aresample={_TTS_SR},"
+          f"atempo={1.0 / factor:.6f}")
+    try:
+        p = subprocess.run(
+            [_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
+             "-f", "mp3", "-i", "pipe:0", "-af", af, "-f", "mp3", "pipe:1"],
+            input=mp3, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+        if p.returncode == 0 and p.stdout:
+            return p.stdout
+    except Exception:
+        pass
+    return mp3
+
+
 def _synth_video_audio(script: str, default_voice: str) -> bytes:
     """Sinh audio cho video.
     - Neu script la hoi thoai (nhieu dong dang [Ten|voice]: ... hoac [Ten]: ...)
@@ -1364,7 +1404,7 @@ def _synth_video_audio(script: str, default_voice: str) -> bytes:
             return resp.content
         with ThreadPoolExecutor(max_workers=4) as ex:
             parts = list(ex.map(_tts, parsed))
-        return b''.join(parts)
+        return _pitch_up(b''.join(parts))
 
     # Script don -> 1 giong
     clean = re.sub(r'\[.*?\]\s*:?', '', script)
@@ -1374,7 +1414,7 @@ def _synth_video_audio(script: str, default_voice: str) -> bytes:
     resp = openai_client.audio.speech.create(
         model="tts-1", voice=default_voice, input=clean, response_format="mp3"
     )
-    return resp.content
+    return _pitch_up(resp.content)
 
 
 def _synth_single_voice(script: str, voice: str) -> bytes:
@@ -1388,7 +1428,7 @@ def _synth_single_voice(script: str, voice: str) -> bytes:
     resp = openai_client.audio.speech.create(
         model="tts-1", voice=voice, input=clean, response_format="mp3"
     )
-    return resp.content
+    return _pitch_up(resp.content)
 
 
 def _build_video_sync(req: VideoRequest) -> bytes:
@@ -1672,6 +1712,229 @@ def video_result(job_id: str):
     return FileResponse(
         job["path"], media_type="video/mp4", filename="tiktok_video.mp4"
     )
+
+
+# =========================================================================
+# ĐĂNG VIDEO LÊN TIKTOK — Content Posting API (Direct Post, FILE_UPLOAD)
+# Luong: user bam "Ket noi TikTok" -> OAuth (Login Kit) -> backend luu token theo uid
+#        -> "Dang len TikTok" doc MP4 cua job -> init + upload + (chon privacy).
+# CAU HINH env tren Render: TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET,
+#   TIKTOK_REDIRECT_URI (trung CHINH XAC voi khai bao tren TikTok app),
+#   FRONTEND_URL (de redirect ve sau khi xong).
+# LUU Y: app chua qua TikTok audit -> chi dang duoc RIENG TU (SELF_ONLY) vao tai khoan
+#   chu app. Sau khi duyet video.publish moi dang PUBLIC_TO_EVERYONE (code da san).
+# =========================================================================
+from urllib.parse import urlencode
+from fastapi.responses import RedirectResponse
+
+TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "")
+TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "")
+TIKTOK_REDIRECT_URI = os.getenv(
+    "TIKTOK_REDIRECT_URI",
+    "https://tiktok-ai-backend-mq3e.onrender.com/api/tiktok/callback")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://tiktok-frontend-sigma.vercel.app").rstrip("/")
+TIKTOK_SCOPES = "user.info.basic,video.publish"
+
+_TT_OAUTH = "https://www.tiktok.com/v2/auth/authorize/"
+_TT_TOKEN = "https://open.tiktokapis.com/v2/oauth/token/"
+_TT_API = "https://open.tiktokapis.com/v2"
+
+# state OAuth (song ~vai giay) -> map ve uid. In-memory du cho free tier 1 process.
+_tt_states: dict = {}
+_tt_states_lock = threading.Lock()
+_TT_STATE_TTL = 600
+
+def _tiktok_cfg_ok() -> bool:
+    return bool(TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET)
+
+def _tt_put_state(uid: str) -> str:
+    s = uuid.uuid4().hex
+    now = time.time()
+    with _tt_states_lock:
+        for k in [k for k, (_, t) in _tt_states.items() if now - t > _TT_STATE_TTL]:
+            _tt_states.pop(k, None)
+        _tt_states[s] = (uid, now)
+    return s
+
+def _tt_pop_state(s: str):
+    with _tt_states_lock:
+        v = _tt_states.pop(s, None)
+    if not v or time.time() - v[1] > _TT_STATE_TTL:
+        return None
+    return v[0]
+
+def _tt_token_request(payload: dict) -> dict:
+    with httpx.Client(timeout=20) as c:
+        r = c.post(_TT_TOKEN, data=payload,
+                   headers={"Content-Type": "application/x-www-form-urlencoded"})
+    return r.json()
+
+def _tt_store_token(uid: str, d: dict, keep_refresh: str | None = None) -> None:
+    set_tiktok_token(uid, {
+        "access_token": d.get("access_token"),
+        "refresh_token": d.get("refresh_token") or keep_refresh,
+        "open_id": d.get("open_id"),
+        "scope": d.get("scope"),
+        "expires_at": time.time() + int(d.get("expires_in", 0)) - 60,
+    })
+
+def _tt_access_token(uid: str):
+    """Tra access_token con han (tu refresh neu het). None neu chua ket noi / loi."""
+    tok = get_tiktok_token(uid)
+    if not tok:
+        return None
+    if time.time() < tok.get("expires_at", 0) and tok.get("access_token"):
+        return tok["access_token"]
+    rt = tok.get("refresh_token")
+    if not rt:
+        return None
+    d = _tt_token_request({
+        "client_key": TIKTOK_CLIENT_KEY, "client_secret": TIKTOK_CLIENT_SECRET,
+        "grant_type": "refresh_token", "refresh_token": rt,
+    })
+    if not d.get("access_token"):
+        return None
+    _tt_store_token(uid, d, keep_refresh=rt)
+    return d["access_token"]
+
+def _tt_api_post(path: str, access_token: str, body: dict | None = None) -> dict:
+    with httpx.Client(timeout=30) as c:
+        r = c.post(f"{_TT_API}{path}",
+                   headers={"Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json; charset=UTF-8"},
+                   json=body if body is not None else {})
+    return r.json()
+
+def _tt_pick_privacy(access_token: str, want_public: bool) -> str:
+    """Chon privacy theo quyen THAT SU cua tai khoan (creator_info). App chua audit -> SELF_ONLY."""
+    try:
+        ci = _tt_api_post("/post/publish/creator_info/query/", access_token)
+        opts = (ci.get("data") or {}).get("privacy_level_options") or []
+        if want_public and "PUBLIC_TO_EVERYONE" in opts:
+            return "PUBLIC_TO_EVERYONE"
+        if opts:
+            return opts[0]
+    except Exception:
+        pass
+    return "SELF_ONLY"
+
+def _tt_publish_file(access_token: str, video: bytes, title: str, privacy: str) -> str:
+    """Direct Post 1 video qua FILE_UPLOAD (1 chunk, video nhe < 64MB). Tra publish_id."""
+    size = len(video)
+    init = _tt_api_post("/post/publish/video/init/", access_token, {
+        "post_info": {
+            "title": title[:150], "privacy_level": privacy,
+            "disable_comment": False, "disable_duet": False, "disable_stitch": False,
+        },
+        "source_info": {
+            "source": "FILE_UPLOAD", "video_size": size,
+            "chunk_size": size, "total_chunk_count": 1,
+        },
+    })
+    err = init.get("error") or {}
+    if err.get("code") not in (None, "ok", ""):
+        raise RuntimeError(err.get("message") or "TikTok init thất bại")
+    data = init.get("data") or {}
+    publish_id, upload_url = data.get("publish_id"), data.get("upload_url")
+    if not publish_id or not upload_url:
+        raise RuntimeError("TikTok không trả upload_url/publish_id")
+    with httpx.Client(timeout=180) as c:
+        pr = c.put(upload_url, content=video,
+                   headers={"Content-Type": "video/mp4",
+                            "Content-Length": str(size),
+                            "Content-Range": f"bytes 0-{size - 1}/{size}"})
+    if pr.status_code not in (200, 201, 206):
+        raise RuntimeError(f"Upload video lên TikTok thất bại (HTTP {pr.status_code})")
+    return publish_id
+
+
+@app.get("/api/tiktok/auth-url")
+def tiktok_auth_url(uid: str = Depends(require_uid)):
+    """Tra URL de user dang nhap TikTok va cap quyen (Login Kit). Frontend dieu huong toi."""
+    if not _tiktok_cfg_ok():
+        raise HTTPException(503, "Backend chưa cấu hình TikTok (thiếu TIKTOK_CLIENT_KEY/SECRET).")
+    state = _tt_put_state(uid)
+    q = urlencode({
+        "client_key": TIKTOK_CLIENT_KEY, "scope": TIKTOK_SCOPES,
+        "response_type": "code", "redirect_uri": TIKTOK_REDIRECT_URI, "state": state,
+    })
+    return {"auth_url": f"{_TT_OAUTH}?{q}"}
+
+@app.get("/api/tiktok/callback")
+def tiktok_callback(code: str = "", state: str = "", error: str = ""):
+    """TikTok redirect ve day sau khi user cap quyen -> doi code->token, luu theo uid, ve frontend."""
+    if error or not code or not state:
+        return RedirectResponse(f"{FRONTEND_URL}/?tiktok=error")
+    uid = _tt_pop_state(state)
+    if not uid:
+        return RedirectResponse(f"{FRONTEND_URL}/?tiktok=expired")
+    try:
+        d = _tt_token_request({
+            "client_key": TIKTOK_CLIENT_KEY, "client_secret": TIKTOK_CLIENT_SECRET,
+            "code": code, "grant_type": "authorization_code",
+            "redirect_uri": TIKTOK_REDIRECT_URI,
+        })
+        if not d.get("access_token"):
+            return RedirectResponse(f"{FRONTEND_URL}/?tiktok=error")
+        _tt_store_token(uid, d)
+    except Exception:
+        return RedirectResponse(f"{FRONTEND_URL}/?tiktok=error")
+    return RedirectResponse(f"{FRONTEND_URL}/?tiktok=connected")
+
+@app.get("/api/tiktok/status")
+def tiktok_status(uid: str = Depends(require_uid)):
+    """Frontend hoi da ket noi TikTok chua (de doi nut Ket noi/Dang)."""
+    tok = get_tiktok_token(uid)
+    return {"connected": bool(tok and tok.get("refresh_token")),
+            "configured": _tiktok_cfg_ok()}
+
+@app.post("/api/tiktok/disconnect")
+def tiktok_disconnect(uid: str = Depends(require_uid)):
+    clear_tiktok_token(uid)
+    return {"connected": False}
+
+class TikTokPublishRequest(BaseModel):
+    job_id: str
+    title: str = ""
+    public: bool = True
+
+@app.post("/api/tiktok/publish")
+def tiktok_publish(req: TikTokPublishRequest, uid: str = Depends(require_uid)):
+    """Dang video cua 1 job len TikTok cua user (Direct Post). Tra publish_id + privacy thuc te."""
+    if not _tiktok_cfg_ok():
+        raise HTTPException(503, "Backend chưa cấu hình TikTok.")
+    access = _tt_access_token(uid)
+    if not access:
+        raise HTTPException(401, "Chưa kết nối TikTok hoặc phiên hết hạn — kết nối lại nhé.")
+    with _jobs_lock:
+        job = _jobs.get(req.job_id)
+    if not job or job.get("uid") != uid:
+        raise HTTPException(404, "Không tìm thấy video (job hết hạn hoặc không phải của bạn).")
+    if job.get("status") != "done" or not job.get("path") or not os.path.exists(job["path"]):
+        raise HTTPException(409, "Video chưa sẵn sàng.")
+    with open(job["path"], "rb") as f:
+        video = f.read()
+    privacy = _tt_pick_privacy(access, req.public)
+    try:
+        publish_id = _tt_publish_file(access, video, req.title or "Video tạo bởi AI", privacy)
+    except Exception as e:
+        raise HTTPException(502, f"Đăng TikTok thất bại: {e}")
+    public = privacy == "PUBLIC_TO_EVERYONE"
+    return {
+        "publish_id": publish_id, "privacy": privacy, "public": public,
+        "note": ("Đã gửi đăng công khai lên TikTok." if public else
+                 "App chưa được TikTok duyệt đăng công khai → video đăng dạng RIÊNG TƯ (chỉ mình bạn) "
+                 "trên tài khoản của bạn. Mở app TikTok để xem/chỉnh."),
+    }
+
+@app.get("/api/tiktok/publish-status/{publish_id}")
+def tiktok_publish_status(publish_id: str, uid: str = Depends(require_uid)):
+    """Hoi trang thai dang (PROCESSING / PUBLISH_COMPLETE / FAILED...)."""
+    access = _tt_access_token(uid)
+    if not access:
+        raise HTTPException(401, "Chưa kết nối TikTok.")
+    d = _tt_api_post("/post/publish/status/fetch/", access, {"publish_id": publish_id})
+    return d.get("data", d)
 
 
 if __name__ == "__main__":
