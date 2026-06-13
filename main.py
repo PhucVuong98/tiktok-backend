@@ -255,6 +255,124 @@ def ai_update_trends(uid: str = Depends(require_uid)):
 
 
 # =========================================================================
+# PHẦN 1B: GIÁ VÀNG — cập nhật giá vàng trong nước (PNJ) + thế giới (goldprice.org)
+# Endpoint CÔNG KHAI, $0 (chỉ HTTP, KHÔNG gọi OpenAI). Tra ve them `script_seed`
+# (text mo ta gia da format san, KHONG LLM) de frontend dua thang vao /api/generate-video.
+# =========================================================================
+_GOLD_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+_GOLD_CACHE_TTL = 60          # giay: tranh hammer nguon khi nhieu user refresh
+_gold_cache: dict = {"data": None, "ts": 0.0}
+
+def _fetch_world_gold() -> dict | None:
+    """Gia vang the gioi (XAU, USD/ounce). Ghep 2 nguon mien phi, khong key:
+    - gold-api.com: gia spot chinh xac (on dinh, nhung khong co % thay doi).
+    - coingecko PAX Gold (PAXG, bam sat gia vang): bo sung % thay doi 24h.
+    Tra ve None neu ca 2 deu loi."""
+    price = pct = None
+    try:
+        with httpx.Client(timeout=10, headers=_GOLD_UA) as c:
+            r = c.get("https://api.gold-api.com/price/XAU")
+        price = round(float(r.json()["price"]), 2)
+    except Exception:
+        pass
+    try:
+        with httpx.Client(timeout=10, headers=_GOLD_UA) as c:
+            r = c.get("https://api.coingecko.com/api/v3/simple/price",
+                      params={"ids": "pax-gold", "vs_currencies": "usd",
+                              "include_24hr_change": "true"})
+        pg = r.json()["pax-gold"]
+        pct = round(float(pg["usd_24h_change"]), 2)
+        if price is None:
+            price = round(float(pg["usd"]), 2)
+    except Exception:
+        pass
+    if price is None:
+        return None
+    prev = change = None
+    if pct is not None:
+        prev = round(price / (1 + pct / 100), 2)
+        change = round(price - prev, 2)
+    return {"price_usd": price, "change": change, "pct_change": pct,
+            "prev_close": prev, "unit": "USD/ounce"}
+
+def _fetch_domestic_gold(limit: int = 6) -> tuple[list, str]:
+    """Gia vang trong nuoc tu PNJ edge API. Tra ve (list, updateDate). [] neu loi.
+    PNJ tra giaban/giamua theo NGHIN DONG / chi -> nhan 1000 ra VND."""
+    try:
+        with httpx.Client(timeout=10) as c:
+            r = c.get("https://edge-api.pnj.io/ecom-frontend/v1/get-gold-price", headers=_GOLD_UA)
+        d = r.json()
+        out = []
+        for it in d.get("data", [])[:limit]:
+            try:
+                out.append({
+                    "name": str(it.get("tensp", "")).strip(),
+                    "buy": int(round(float(it["giamua"]) * 1000)),
+                    "sell": int(round(float(it["giaban"]) * 1000)),
+                })
+            except Exception:
+                continue
+        return out, str(d.get("updateDate", ""))
+    except Exception:
+        return [], ""
+
+def _vnd_trieu(v: int) -> str:
+    """VND -> chuoi 'X,Y trieu' (dau phay thap phan kieu VN)."""
+    return f"{v / 1_000_000:.1f}".replace(".", ",") + " triệu"
+
+def _gold_script_seed(world: dict | None, domestic: list) -> str:
+    """Ghep text mo ta gia vang (KHONG LLM) -> dua vao pipeline video de scriptify."""
+    parts = ["Cập nhật giá vàng hôm nay!"]
+    if world:
+        px = f'{world["price_usd"]:,.0f}'.replace(",", ".")
+        if world.get("pct_change") is not None:
+            d = "tăng" if world["pct_change"] >= 0 else "giảm"
+            parts.append(f'Vàng thế giới đang ở mức {px} đô la Mỹ mỗi ounce, '
+                         f'{d} {abs(world["pct_change"])} phần trăm so với phiên trước.')
+        else:
+            parts.append(f'Vàng thế giới đang ở mức {px} đô la Mỹ mỗi ounce.')
+    if domestic:
+        g = domestic[0]
+        parts.append(f'Trong nước, {g["name"]} mua vào {_vnd_trieu(g["buy"])}, '
+                     f'bán ra {_vnd_trieu(g["sell"])} mỗi chỉ.')
+        if len(domestic) > 1:
+            g2 = domestic[1]
+            parts.append(f'{g2["name"]} bán ra {_vnd_trieu(g2["sell"])} mỗi chỉ.')
+    parts.append("Vàng đang là kênh đầu tư được nhiều người quan tâm, "
+                 "anh em nhớ theo dõi để cập nhật giá mới nhất nhé!")
+    return " ".join(parts)
+
+@app.get("/api/gold-prices")
+def gold_prices():
+    """Gia vang trong nuoc + the gioi (CONG KHAI, $0). Cache 60s. `script_seed` san de tao video."""
+    now = time.time()
+    if _gold_cache["data"] and now - _gold_cache["ts"] < _GOLD_CACHE_TTL:
+        return _gold_cache["data"]
+
+    world = _fetch_world_gold()
+    domestic, upd = _fetch_domestic_gold()
+
+    if world is None and not domestic:
+        # Ca 2 nguon fail -> dung cache cu neu co, khong thi 503
+        if _gold_cache["data"]:
+            stale = {**_gold_cache["data"], "stale": True}
+            return stale
+        raise HTTPException(status_code=503, detail="Không lấy được dữ liệu giá vàng, thử lại sau nhé.")
+
+    data = {
+        "world": world,
+        "domestic": domestic,
+        "domestic_source": "PNJ",
+        "domestic_updated": upd,
+        "script_seed": _gold_script_seed(world, domestic),
+        "stale": False,
+    }
+    _gold_cache["data"] = data
+    _gold_cache["ts"] = now
+    return data
+
+
+# =========================================================================
 # PHẦN 2: SCRIPT ĐƠN — 1 kịch bản theo tone
 # =========================================================================
 class ScriptRequest(BaseModel):
@@ -1102,7 +1220,7 @@ Yêu cầu:
 - Mỗi nhân vật nói đúng phong cách riêng, nghe khác biệt rõ.
 - Nửa đầu nêu vấn đề/tình huống, chưa khoe sản phẩm. Giữ 1 câu chê nhỏ cho chân thật.
 - Kết bằng lời kêu gọi mua nhẹ nhàng.
-- Khoảng 10-16 lượt thoại, mỗi lượt 1-2 câu ngắn gọn.
+- NGẮN GỌN cho video 25-30 giây: khoảng 8-11 lượt thoại, mỗi lượt 1 câu ngắn (toàn bài ~90-105 từ). Cô đọng, bỏ câu thừa.
 
 Định dạng MỖI dòng ĐÚNG như sau (không markdown, không số thứ tự, không thêm gì khác):
 [{persona_a['name']}|{persona_a['voice']}]: lời thoại
@@ -1135,7 +1253,7 @@ Yêu cầu:
 - Một người nói liền mạch (không hội thoại, không tên người nói, không stage direction).
 - Giữ mạch: mở đầu nêu vấn đề/tình huống → giới thiệu sản phẩm như giải pháp → 1 câu chê nhỏ cho chân thật → kết bằng lời kêu gọi mua nhẹ nhàng.
 - Nói đúng phong cách nhân vật, dùng từ ngữ tự nhiên của họ.
-- Độ dài vừa phải cho video ~40-55 giây (khoảng 90-130 từ).
+- NGẮN GỌN cho video 25-30 giây (khoảng 90-105 từ). Cô đọng, mỗi câu một ý, bỏ câu thừa.
 - CHỈ trả về phần lời nói thuần, không ký hiệu [], không gạch đầu dòng.""",
         temperature=0.85,
     )
