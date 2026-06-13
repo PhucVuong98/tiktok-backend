@@ -17,6 +17,7 @@ import textwrap
 import tempfile
 import threading
 import queue as _queue
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -316,6 +317,37 @@ def _fetch_domestic_gold(limit: int = 6) -> tuple[list, str]:
     except Exception:
         return [], ""
 
+def _parse_gold_num(s: str | None) -> int | None:
+    """'14,700' (nghin dong/chi) -> 14700000 VND. '-' / rong -> None."""
+    if not s:
+        return None
+    digits = s.strip().replace(",", "").replace(".", "")
+    if not digits.isdigit():
+        return None
+    return int(digits) * 1000
+
+def _fetch_doji_gold(limit: int = 6) -> tuple[list, str]:
+    """Gia vang DOJI tu XML feed cong khai. Tra ve (rows, updated). [] neu loi.
+    Bo qua hang chi co gia mua (nguyen lieu) cho bang gon."""
+    try:
+        with httpx.Client(timeout=10, headers=_GOLD_UA, follow_redirects=True) as c:
+            r = c.get("https://update.giavang.doji.vn/banggia/doji_92411/get")
+        root = ET.fromstring(r.text)
+        dt = root.find(".//DateTime")
+        upd = dt.text.strip() if dt is not None and dt.text else ""
+        rows = []
+        for row in root.findall(".//Row"):
+            name = (row.get("Name") or "").strip()
+            sell = _parse_gold_num(row.get("Sell"))
+            buy = _parse_gold_num(row.get("Buy"))
+            if name and sell:           # bo hang khong co gia ban (vd nguyen lieu 18k)
+                rows.append({"name": name, "buy": buy, "sell": sell})
+            if len(rows) >= limit:
+                break
+        return rows, upd
+    except Exception:
+        return [], ""
+
 def _vnd_trieu(v: int) -> str:
     """VND -> chuoi 'X,Y trieu' (dau phay thap phan kieu VN)."""
     return f"{v / 1_000_000:.1f}".replace(".", ",") + " triệu"
@@ -333,8 +365,11 @@ def _gold_script_seed(world: dict | None, domestic: list) -> str:
             parts.append(f'Vàng thế giới đang ở mức {px} đô la Mỹ mỗi ounce.')
     if domestic:
         g = domestic[0]
-        parts.append(f'Trong nước, {g["name"]} mua vào {_vnd_trieu(g["buy"])}, '
-                     f'bán ra {_vnd_trieu(g["sell"])} mỗi chỉ.')
+        if g.get("buy"):
+            parts.append(f'Trong nước, {g["name"]} mua vào {_vnd_trieu(g["buy"])}, '
+                         f'bán ra {_vnd_trieu(g["sell"])} mỗi chỉ.')
+        else:
+            parts.append(f'Trong nước, {g["name"]} bán ra {_vnd_trieu(g["sell"])} mỗi chỉ.')
         if len(domestic) > 1:
             g2 = domestic[1]
             parts.append(f'{g2["name"]} bán ra {_vnd_trieu(g2["sell"])} mỗi chỉ.')
@@ -350,21 +385,28 @@ def gold_prices():
         return _gold_cache["data"]
 
     world = _fetch_world_gold()
-    domestic, upd = _fetch_domestic_gold()
+    pnj_rows, pnj_upd = _fetch_domestic_gold()
+    doji_rows, doji_upd = _fetch_doji_gold()
+
+    # domestic = danh sach nguon, moi nguon co bang gia rieng (chi giu nguon lay duoc)
+    domestic = []
+    if pnj_rows:
+        domestic.append({"source": "PNJ", "updated": pnj_upd, "rows": pnj_rows})
+    if doji_rows:
+        domestic.append({"source": "DOJI", "updated": doji_upd, "rows": doji_rows})
 
     if world is None and not domestic:
-        # Ca 2 nguon fail -> dung cache cu neu co, khong thi 503
+        # Tat ca nguon fail -> dung cache cu neu co, khong thi 503
         if _gold_cache["data"]:
-            stale = {**_gold_cache["data"], "stale": True}
-            return stale
+            return {**_gold_cache["data"], "stale": True}
         raise HTTPException(status_code=503, detail="Không lấy được dữ liệu giá vàng, thử lại sau nhé.")
 
+    # script_seed dung bang gia cua nguon dau tien lay duoc (PNJ uu tien)
+    primary_rows = domestic[0]["rows"] if domestic else []
     data = {
         "world": world,
         "domestic": domestic,
-        "domestic_source": "PNJ",
-        "domestic_updated": upd,
-        "script_seed": _gold_script_seed(world, domestic),
+        "script_seed": _gold_script_seed(world, primary_rows),
         "stale": False,
     }
     _gold_cache["data"] = data
